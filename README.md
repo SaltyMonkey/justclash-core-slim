@@ -97,8 +97,22 @@ Settings -> Actions -> General -> Workflow permissions
 and allow read/write permissions if your repository or organization policy does
 not allow the explicit workflow permissions to grant them.
 
-No PAT or additional secret is normally required. The workflows use the
-repository's `GITHUB_TOKEN`.
+The builder also needs a token that is allowed to create and update workflow
+files. The built-in `GITHUB_TOKEN` cannot push the patched upstream
+`.github/workflows/build.yml` to the temporary `build/*` branch, even when
+`contents: write` and `actions: write` are enabled.
+
+Create a repository secret named `BUILDER_TOKEN`. Prefer a fine-grained token
+limited to this repository with read/write access to Contents and Actions, plus
+write access to Workflows. A classic token needs repository access
+(`public_repo` for a public repository, or `repo` where appropriate) together
+with the `workflow` scope.
+The token is used only by the Alpha and stable build jobs; version detection
+continues to use the built-in `GITHUB_TOKEN`.
+
+Never commit the token to this repository or place it in workflow arguments.
+Store it only as the `BUILDER_TOKEN` Actions secret and rotate it before it
+expires.
 
 ## Schedule
 
