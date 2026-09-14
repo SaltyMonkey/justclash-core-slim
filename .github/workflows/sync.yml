@@ -101,7 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ./scripts/build-upstream.sh \
+          bash ./scripts/build-upstream.sh \
             --channel alpha \
             --upstream-url https://github.com/MetaCubeX/mihomo.git \
             --upstream-ref Alpha \
@@ -121,7 +121,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ./scripts/build-upstream.sh \
+          bash ./scripts/build-upstream.sh \
             --channel stable \
             --upstream-url https://github.com/MetaCubeX/mihomo.git \
             --upstream-ref "${{ needs.detect.outputs.stable_tag }}" \
