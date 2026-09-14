@@ -1,0 +1,24 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -200,9 +200,9 @@ jobs:
+       run: |
+         export SKIP_CONCURRENT_TEST=1
+         export SKIP_INTEROP_TEST=1
+-        go test ./...
++        go test ./... -tags "no_easytier,no_tailscale,no_zerotier"
+         echo "---test with_gvisor---"
+-        go test ./... -tags "with_gvisor" -count=1
++        go test ./... -tags "with_gvisor,no_easytier,no_tailscale,no_zerotier" -count=1
+
+     - name: Update CA
+       run: |
+@@ -219,7 +219,7 @@ jobs:
+         GOMIPS: ${{matrix.jobs.gomips}}
+       run: |
+         go env
+-        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
++        go build -v -tags "with_gvisor,no_easytier,no_tailscale,no_zerotier" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}-tiny' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+         if [ "${{matrix.jobs.goos}}" = "windows" ]; then
+           cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+           zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe

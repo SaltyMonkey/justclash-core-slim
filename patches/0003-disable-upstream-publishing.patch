@@ -1,0 +1,23 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -395,8 +395,8 @@ jobs:
+         body_path: release.txt
+ 
+   Upload-Release:
+     permissions: write-all
+-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
++    if: ${{ false }}
+     needs: [build]
+     runs-on: ubuntu-latest
+     steps:
+@@ -453,8 +453,8 @@ jobs:
+           files: bin/*
+           body_path: release.md
+ 
+   Docker:
+-    if: ${{ !startsWith(github.event_name, 'pull_request') }}
++    if: ${{ false }}
+     permissions: write-all
+     needs: [build]
+     runs-on: ubuntu-latest

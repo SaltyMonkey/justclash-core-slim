@@ -1,0 +1,20 @@
+diff --git a/hub/route/upgrade.go b/hub/route/upgrade.go
+--- a/hub/route/upgrade.go
++++ b/hub/route/upgrade.go
+@@ -14,10 +14,15 @@ func upgradeRouter() http.Handler {
+ 	r := chi.NewRouter()
+ 	r.Post("/ui", updateUI)
+ 	if !embedMode { // disallow upgrade core/geo in embed mode
+-		r.Post("/", upgradeCore)
++		r.Post("/", coreUpgradeDisabled)
+ 		r.Post("/geo", updateGeoDatabases)
+ 	}
+ 	return r
+ }
++func coreUpgradeDisabled(w http.ResponseWriter, r *http.Request) {
++	render.Status(r, http.StatusForbidden)
++	render.JSON(w, r, newError("core self-update is disabled in tiny builds"))
++}
++
+ 
+ func upgradeCore(w http.ResponseWriter, r *http.Request) {
