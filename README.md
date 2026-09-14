@@ -15,8 +15,9 @@ When a new version is found it:
 2. applies every `patches/*.patch`;
 3. temporarily pushes the patched source to a `build/*` branch;
 4. runs MetaCubeX/mihomo's original `.github/workflows/build.yml`;
-5. downloads the resulting binary archives;
-6. attaches the exact patched source as `custom-core-source.tar.gz`;
+5. downloads the resulting build artifacts;
+6. attaches the corresponding patched source as `custom-core-source.tar.gz`
+   and the vendored Go dependencies as `vendor.tar.gz`;
 7. publishes/updates the downstream release while keeping the original versioned `mihomo-*` binary names and upstream-compatible `version.txt`;
 8. deletes the temporary `build/*` branch.
 
@@ -27,6 +28,8 @@ When a new version is found it:
 There is only one rolling prerelease:
 
 `Prerelease-Alpha`
+
+Both its tag and release title are `Prerelease-Alpha`, matching upstream.
 
 Its assets are replaced when `MetaCubeX/mihomo:Alpha` changes.
 
@@ -41,7 +44,7 @@ names change together with the upstream commit.
 ### Stable
 
 Each upstream stable release creates a separate downstream release using the
-same version tag, for example:
+same version tag and title, for example:
 
 `v1.19.31`
 
@@ -67,6 +70,12 @@ Each release also contains an upstream-compatible `version.txt`. It stores the
 build version without the downstream `-tiny` suffix: for example, `v1.19.31` for
 a stable release or `alpha-<short-sha>` for an Alpha build. As in the upstream
 workflow, `version.txt` is not included in `checksums.txt`.
+
+`custom-core-source.tar.gz` contains the patched source, a dated downstream
+modification notice, and its vendored Go dependencies. The same dependencies are
+also published separately as `vendor.tar.gz`, matching the upstream release
+convention. A copy of the upstream GPL-3.0 `LICENSE` is attached directly to the
+release as well as being included in the source archive.
 
 ## Files in this repository
 
@@ -131,8 +140,11 @@ The nightly build deliberately fails if an upstream change makes the patch stop
 applying. That is preferable to silently publishing a binary built with
 different options.
 
-The release contains `custom-core-source.tar.gz`, which is the exact patched
-source tree used for that binary build.
+The release contains `custom-core-source.tar.gz`, a corresponding-source
+snapshot assembled from the patched commit and the canonical packaging job. It
+includes vendored Go dependencies. Transient runner state and regenerated build
+data, such as the refreshed CA bundle, are reproducibly described by the patched
+workflow rather than included in this archive.
 
 ## Upstream ownership and licensing
 
@@ -148,15 +160,16 @@ MetaCubeX/mihomo is distributed under the GNU General Public License version 3
 This downstream repository and its patches follow the same GPL-3.0 terms.
 
 Bundled third-party components remain subject to their own licenses, copyright
-notices, and attribution requirements. The exact patched source distributed
-with each binary release retains those files and notices. Nothing in this
-repository replaces, overrides, or grants rights beyond the applicable upstream
-and third-party licenses.
+notices, and attribution requirements. The corresponding source distributed
+with each binary release retains those files and notices and includes a dated
+`DOWNSTREAM.md` describing the modifications. Nothing in this repository
+replaces, overrides, or grants rights beyond the applicable upstream and
+third-party licenses.
 
 Each release provides the corresponding patched source in
-`custom-core-source.tar.gz` alongside the modified binaries. Keep that source
-archive, the license text, and all copyright notices available when
-redistributing a build.
+`custom-core-source.tar.gz` and the standalone `vendor.tar.gz` alongside the
+modified binaries. Keep those source archives, the license text, and all
+copyright notices available when redistributing a build.
 
 ## Disclaimer
 

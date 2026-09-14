@@ -147,6 +147,8 @@ if [[ "$CHANNEL" == "alpha" ]]; then
   VERSION="alpha-${UPSTREAM_SHA:0:7}"
 fi
 
+MODIFIED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
 echo "Channel:      $CHANNEL"
 echo "Upstream ref: $UPSTREAM_REF"
 echo "Version:      $VERSION"
@@ -164,6 +166,25 @@ for patch in "${PATCHES[@]}"; do
   git -C "$SOURCE_DIR" apply "$patch"
 done
 
+cat > "$SOURCE_DIR/DOWNSTREAM.md" <<EOF
+# Downstream modification notice
+
+This source tree is an unofficial modified version of MetaCubeX/mihomo.
+
+- Modification date (UTC): ${MODIFIED_AT}
+- Upstream ref: ${UPSTREAM_REF}
+- Upstream commit: ${UPSTREAM_SHA}
+- Downstream runtime version: ${VERSION}-tiny
+
+Downstream changes disable EasyTier, Tailscale, and ZeroTier at build time, add
+Linux builds without gVisor, append the \`-tiny\` runtime version suffix, disable
+the core self-update API, and prevent the temporary upstream workflow from
+publishing releases or container images.
+
+This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
+license text. Original copyright and license notices remain in effect.
+EOF
+
 git -C "$SOURCE_DIR" config user.name "github-actions[bot]"
 git -C "$SOURCE_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git -C "$SOURCE_DIR" add -A
@@ -176,13 +197,6 @@ PATCHED_SHA="$(
   printf 'Downstream build changes for %s %s\n' "$CHANNEL" "$VERSION" \
     | git -C "$SOURCE_DIR" commit-tree "$SOURCE_TREE_SHA"
 )"
-
-# Exact corresponding source for the binaries, including the patched workflow.
-git -C "$SOURCE_DIR" archive \
-  --format=tar.gz \
-  --prefix=source/ \
-  -o "$WORK_DIR/custom-core-source.tar.gz" \
-  "$PATCHED_SHA"
 
 git -C "$SOURCE_DIR" remote add downstream \
   "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPOSITORY}.git"
@@ -246,9 +260,8 @@ gh run download "$RUN_ID" \
   --repo "$TARGET_REPOSITORY" \
   --dir "$DIST_DIR"
 
-# Publish only binary archives. The original CI may also create distro packages,
-# toolchains and vendor archives; those remain workflow artifacts but are not
-# copied into our downstream release.
+# Publish binary archives, the vendored Go source, and a corresponding-source
+# snapshot. Distro packages and toolchains remain workflow artifacts.
 while IFS= read -r -d '' file; do
   base="$(basename "$file")"
   cp "$file" "$RELEASE_DIR/$base"
@@ -258,7 +271,23 @@ done < <(
     -print0
 )
 
-cp "$WORK_DIR/custom-core-source.tar.gz" "$RELEASE_DIR/"
+VENDOR_ARCHIVE="$(find "$DIST_DIR" -type f -name vendor.tar.gz -print -quit)"
+if [[ -z "$VENDOR_ARCHIVE" ]]; then
+  echo "The upstream build did not produce vendor.tar.gz." >&2
+  exit 5
+fi
+
+SOURCE_SNAPSHOT_DIR="$WORK_DIR/source-snapshot/source"
+mkdir -p "$SOURCE_SNAPSHOT_DIR"
+git -C "$SOURCE_DIR" archive "$PATCHED_SHA" \
+  | tar -x -C "$SOURCE_SNAPSHOT_DIR"
+tar -xzf "$VENDOR_ARCHIVE" -C "$SOURCE_SNAPSHOT_DIR"
+tar -C "$WORK_DIR/source-snapshot" \
+  -czf "$RELEASE_DIR/custom-core-source.tar.gz" \
+  source
+
+cp "$VENDOR_ARCHIVE" "$RELEASE_DIR/vendor.tar.gz"
+cp "$SOURCE_DIR/LICENSE" "$RELEASE_DIR/LICENSE"
 printf '%s\n' "$VERSION" > "$RELEASE_DIR/version.txt"
 
 if ! find "$RELEASE_DIR" -maxdepth 1 -type f -name 'mihomo-*' | grep -q .; then
@@ -282,11 +311,12 @@ NOTES="$WORK_DIR/release-notes.txt"
   echo "Runtime version: ${VERSION}-tiny"
   echo "Build tags: with_gvisor,no_easytier,no_tailscale,no_zerotier"
   echo
-  echo "The exact corresponding source used for this build is attached as custom-core-source.tar.gz."
+  echo "Corresponding patched source and vendored Go dependencies are attached as custom-core-source.tar.gz."
+  echo "The vendored Go dependencies are also attached separately as vendor.tar.gz."
 } > "$NOTES"
 
 # The release tags point to the builder repository, not to a permanent mirror of
-# the upstream codebase. Exact patched source is kept as a release asset instead.
+# the upstream codebase. Corresponding patched source is kept as a release asset.
 BUILDER_SHA="$(git -C "$BUILDER_DIR" rev-parse HEAD)"
 
 if gh release view "$RELEASE_TAG" \
@@ -314,13 +344,13 @@ if gh release view "$RELEASE_TAG" \
   if [[ "$CHANNEL" == "alpha" ]]; then
     gh release edit "$RELEASE_TAG" \
       --repo "$TARGET_REPOSITORY" \
-      --title "Core Alpha ${UPSTREAM_SHA:0:7}" \
+      --title "$RELEASE_TAG" \
       --notes-file "$NOTES" \
       --prerelease
   else
     gh release edit "$RELEASE_TAG" \
       --repo "$TARGET_REPOSITORY" \
-      --title "Core $RELEASE_TAG" \
+      --title "$RELEASE_TAG" \
       --notes-file "$NOTES"
   fi
 
@@ -329,14 +359,14 @@ else
     gh release create "$RELEASE_TAG" "$RELEASE_DIR"/* \
       --repo "$TARGET_REPOSITORY" \
       --target "$BUILDER_SHA" \
-      --title "Core Alpha ${UPSTREAM_SHA:0:7}" \
+      --title "$RELEASE_TAG" \
       --notes-file "$NOTES" \
       --prerelease
   else
     gh release create "$RELEASE_TAG" "$RELEASE_DIR"/* \
       --repo "$TARGET_REPOSITORY" \
       --target "$BUILDER_SHA" \
-      --title "Core $RELEASE_TAG" \
+      --title "$RELEASE_TAG" \
       --notes-file "$NOTES"
   fi
 fi
