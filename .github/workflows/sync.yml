@@ -2,7 +2,7 @@ name: Sync upstream builds
 
 on:
   schedule:
-    # 02:30 UTC = 04:30 Tallinn in winter / 05:30 in summer.
+    # 02:30 UTC
     - cron: "30 2 * * *"
   workflow_dispatch:
     inputs:
