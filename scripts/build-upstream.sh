@@ -168,19 +168,21 @@ git -C "$SOURCE_DIR" config user.name "github-actions[bot]"
 git -C "$SOURCE_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git -C "$SOURCE_DIR" add -A
 
-if ! git -C "$SOURCE_DIR" diff --cached --quiet; then
-  git -C "$SOURCE_DIR" commit \
-    -m "Downstream build changes for ${CHANNEL} ${VERSION}"
-fi
-
-PATCHED_SHA="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+# The downstream repository does not contain the shallow upstream commit. Build
+# a self-contained root commit so the temporary branch never references objects
+# that exist only in the upstream repository.
+SOURCE_TREE_SHA="$(git -C "$SOURCE_DIR" write-tree)"
+PATCHED_SHA="$(
+  printf 'Downstream build changes for %s %s\n' "$CHANNEL" "$VERSION" \
+    | git -C "$SOURCE_DIR" commit-tree "$SOURCE_TREE_SHA"
+)"
 
 # Exact corresponding source for the binaries, including the patched workflow.
 git -C "$SOURCE_DIR" archive \
   --format=tar.gz \
   --prefix=source/ \
   -o "$WORK_DIR/custom-core-source.tar.gz" \
-  HEAD
+  "$PATCHED_SHA"
 
 git -C "$SOURCE_DIR" remote add downstream \
   "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPOSITORY}.git"
@@ -188,7 +190,7 @@ git -C "$SOURCE_DIR" remote add downstream \
 # A temporary ref is required because actions/checkout in the original workflow
 # must see the upstream source tree and its patched build.yml.
 git -C "$SOURCE_DIR" push --force downstream \
-  "HEAD:refs/heads/${BUILD_BRANCH}"
+  "${PATCHED_SHA}:refs/heads/${BUILD_BRANCH}"
 
 OLD_RUN_ID="$(
   gh run list \
