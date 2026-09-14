@@ -1,0 +1,22 @@
+name: Upstream Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Build version"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    # The nightly sync dispatches this workflow on a temporary build/* ref.
+    # That ref contains MetaCubeX/mihomo's real build.yml after our patch.
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "This placeholder should only run if build.yml was dispatched from the default branch."
+          exit 1

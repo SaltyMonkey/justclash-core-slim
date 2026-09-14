@@ -1,0 +1,128 @@
+name: Sync upstream builds
+
+on:
+  schedule:
+    # 02:30 UTC = 04:30 Tallinn in winter / 05:30 in summer.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force_alpha:
+        description: "Rebuild Alpha even if the upstream SHA did not change"
+        required: false
+        type: boolean
+        default: false
+      force_stable:
+        description: "Rebuild the latest stable release even if it already exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+
+    outputs:
+      alpha_sha: ${{ steps.detect.outputs.alpha_sha }}
+      alpha_changed: ${{ steps.detect.outputs.alpha_changed }}
+      stable_tag: ${{ steps.detect.outputs.stable_tag }}
+      stable_changed: ${{ steps.detect.outputs.stable_changed }}
+
+    steps:
+      - name: Detect upstream versions
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_ALPHA: ${{ inputs.force_alpha }}
+          FORCE_STABLE: ${{ inputs.force_stable }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALPHA_SHA="$(
+            gh api repos/MetaCubeX/mihomo/commits/Alpha --jq '.sha'
+          )"
+
+          CURRENT_ALPHA="$(
+            gh release view Prerelease-Alpha \
+              --repo "$GITHUB_REPOSITORY" \
+              --json body \
+              --jq '.body' 2>/dev/null |
+            sed -n 's/^Upstream SHA: //p' |
+            head -n1 || true
+          )"
+
+          if [[ "${FORCE_ALPHA:-false}" == "true" || "$ALPHA_SHA" != "$CURRENT_ALPHA" ]]; then
+            ALPHA_CHANGED=true
+          else
+            ALPHA_CHANGED=false
+          fi
+
+          STABLE_TAG="$(
+            gh api repos/MetaCubeX/mihomo/releases/latest --jq '.tag_name'
+          )"
+
+          if [[ "${FORCE_STABLE:-false}" == "true" ]]; then
+            STABLE_CHANGED=true
+          elif gh release view "$STABLE_TAG" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            STABLE_CHANGED=false
+          else
+            STABLE_CHANGED=true
+          fi
+
+          {
+            echo "alpha_sha=$ALPHA_SHA"
+            echo "alpha_changed=$ALPHA_CHANGED"
+            echo "stable_tag=$STABLE_TAG"
+            echo "stable_changed=$STABLE_CHANGED"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Alpha:  $ALPHA_SHA (build=$ALPHA_CHANGED)"
+          echo "Stable: $STABLE_TAG (build=$STABLE_CHANGED)"
+
+  alpha:
+    needs: detect
+    if: needs.detect.outputs.alpha_changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Build and publish Alpha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/build-upstream.sh \
+            --channel alpha \
+            --upstream-url https://github.com/MetaCubeX/mihomo.git \
+            --upstream-ref Alpha \
+            --expected-sha "${{ needs.detect.outputs.alpha_sha }}" \
+            --target-repository "$GITHUB_REPOSITORY"
+
+  stable:
+    needs: detect
+    if: needs.detect.outputs.stable_changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Build and publish stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/build-upstream.sh \
+            --channel stable \
+            --upstream-url https://github.com/MetaCubeX/mihomo.git \
+            --upstream-ref "${{ needs.detect.outputs.stable_tag }}" \
+            --target-repository "$GITHUB_REPOSITORY"
