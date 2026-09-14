@@ -11,6 +11,8 @@ Options:
   --upstream-ref <ref>       Upstream branch or tag to clone
   --expected-sha <sha>       Verify the cloned commit SHA
   --target-repository <repo> Destination repository in owner/name form
+  --git-user-name <name>     Git commit identity name (default: Actions bot)
+  --git-user-email <email>   Git commit identity email (default: Actions bot)
   -h, --help                  Show this help
 EOF
 }
@@ -27,6 +29,8 @@ UPSTREAM_URL=""
 UPSTREAM_REF=""
 EXPECTED_SHA=""
 TARGET_REPOSITORY=""
+GIT_USER_NAME=""
+GIT_USER_EMAIL=""
 
 while (( $# > 0 )); do
   case "$1" in
@@ -85,6 +89,28 @@ while (( $# > 0 )); do
       TARGET_REPOSITORY="${1#*=}"
       shift
       ;;
+    --git-user-name)
+      (( $# >= 2 )) || fail "--git-user-name requires a value"
+      [[ -z "$GIT_USER_NAME" ]] || fail "--git-user-name was specified more than once"
+      GIT_USER_NAME="$2"
+      shift 2
+      ;;
+    --git-user-name=*)
+      [[ -z "$GIT_USER_NAME" ]] || fail "--git-user-name was specified more than once"
+      GIT_USER_NAME="${1#*=}"
+      shift
+      ;;
+    --git-user-email)
+      (( $# >= 2 )) || fail "--git-user-email requires a value"
+      [[ -z "$GIT_USER_EMAIL" ]] || fail "--git-user-email was specified more than once"
+      GIT_USER_EMAIL="$2"
+      shift 2
+      ;;
+    --git-user-email=*)
+      [[ -z "$GIT_USER_EMAIL" ]] || fail "--git-user-email was specified more than once"
+      GIT_USER_EMAIL="${1#*=}"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -99,6 +125,13 @@ done
 [[ -n "$UPSTREAM_URL" ]] || fail "--upstream-url is required"
 [[ -n "$UPSTREAM_REF" ]] || fail "--upstream-ref is required"
 [[ -n "$TARGET_REPOSITORY" ]] || fail "--target-repository is required"
+
+if [[ -z "$GIT_USER_NAME" ]]; then
+  GIT_USER_NAME="github-actions[bot]"
+fi
+if [[ -z "$GIT_USER_EMAIL" ]]; then
+  GIT_USER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+fi
 
 if [[ "$CHANNEL" != "alpha" && "$CHANNEL" != "stable" ]]; then
   fail "unsupported channel: $CHANNEL"
@@ -185,8 +218,6 @@ This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
 license text. Original copyright and license notices remain in effect.
 EOF
 
-git -C "$SOURCE_DIR" config user.name "github-actions[bot]"
-git -C "$SOURCE_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git -C "$SOURCE_DIR" add -A
 
 # The downstream repository does not contain the shallow upstream commit. Build
@@ -195,7 +226,10 @@ git -C "$SOURCE_DIR" add -A
 SOURCE_TREE_SHA="$(git -C "$SOURCE_DIR" write-tree)"
 PATCHED_SHA="$(
   printf 'Downstream build changes for %s %s\n' "$CHANNEL" "$VERSION" \
-    | git -C "$SOURCE_DIR" commit-tree "$SOURCE_TREE_SHA"
+    | git -C "$SOURCE_DIR" \
+        -c "user.name=$GIT_USER_NAME" \
+        -c "user.email=$GIT_USER_EMAIL" \
+        commit-tree "$SOURCE_TREE_SHA"
 )"
 
 git -C "$SOURCE_DIR" remote add downstream \

@@ -59,8 +59,10 @@ The upstream workflow produces two Linux variants for every Linux target:
 - lightweight `nogvisor`: `no_easytier,no_tailscale,no_zerotier`
 
 There is no separate `no_gvisor` build tag. The lightweight variant disables
-gVisor simply by omitting `with_gvisor`. Current upstream already provides both
-`no_easytier` and `no_tailscale` build constraints.
+gVisor simply by omitting `with_gvisor`. Alpha and v1.19.31 provide all three
+`no_easytier`, `no_tailscale`, and `no_zerotier` constraints. Version v1.19.30
+predates EasyTier, so `no_easytier` is a harmless no-op there; the other two
+constraints are present.
 
 Both variants append `-tiny` to the version embedded in the executable. For
 example, the API and `mihomo -v` report `v1.19.31-tiny`, while archive names keep
@@ -122,6 +124,12 @@ continues to use the built-in `GITHUB_TOKEN`.
 Never commit the token to this repository or place it in workflow arguments.
 Store it only as the `BUILDER_TOKEN` Actions secret and rotate it before it
 expires.
+
+The build script attributes its temporary patched-source commit to the standard
+Actions bot identity by default. Manual callers can override it with
+`--git-user-name` and `--git-user-email`. These values are applied only to the
+single `git commit-tree` invocation; the cloned repository's Git configuration
+is not modified.
 
 ## Schedule
 
