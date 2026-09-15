@@ -13,7 +13,7 @@ diff --git a/hub/route/upgrade.go b/hub/route/upgrade.go
  }
 +func coreUpgradeDisabled(w http.ResponseWriter, r *http.Request) {
 +	render.Status(r, http.StatusForbidden)
-+	render.JSON(w, r, newError("core self-update is disabled in tiny builds"))
++	render.JSON(w, r, newError("core self-update is disabled in slim builds"))
 +}
 +
  

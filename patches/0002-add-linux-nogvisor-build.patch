@@ -9,7 +9,7 @@ diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
 +        # Additional lightweight Linux build without gVisor.
 +        # There is no "no_gvisor" tag: gVisor is disabled by omitting "with_gvisor".
 +        if [ "${{matrix.jobs.goos}}" = "linux" ]; then
-+          go build -v -tags "no_easytier,no_tailscale,no_zerotier" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}-tiny' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" -o mihomo-nogvisor
++          go build -v -tags "no_easytier,no_tailscale,no_zerotier" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}-slim' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" -o mihomo-nogvisor
 +          cp mihomo-nogvisor mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-nogvisor
 +          gzip -c mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-nogvisor > mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-nogvisor-${VERSION}.gz
 +          rm mihomo-nogvisor mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-nogvisor

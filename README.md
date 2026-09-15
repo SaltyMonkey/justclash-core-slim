@@ -64,14 +64,22 @@ gVisor simply by omitting `with_gvisor`. Alpha and v1.19.31 provide all three
 predates EasyTier, so `no_easytier` is a harmless no-op there; the other two
 constraints are present.
 
-Both variants append `-tiny` to the version embedded in the executable. For
-example, the API and `mihomo -v` report `v1.19.31-tiny`, while archive names keep
+Both variants append `-slim` to the version embedded in the executable. For
+example, the API and `mihomo -v` report `v1.19.31-slim`, while archive names keep
 the original upstream version format.
 
 Each release also contains an upstream-compatible `version.txt`. It stores the
-build version without the downstream `-tiny` suffix: for example, `v1.19.31` for
+build version without the downstream `-slim` suffix: for example, `v1.19.31` for
 a stable release or `alpha-<short-sha>` for an Alpha build. As in the upstream
 workflow, `version.txt` is not included in `checksums.txt`.
+
+Release notes start with a `Slim build` section that links directly to the exact
+upstream commit used for the build. When the upstream release tag resolves to
+that same commit, its original release notes are appended under a separate
+heading. This SHA check prevents a moving Alpha release from contributing notes
+for a different build. The patched source tree is preserved in the attached
+source archive. Failure to fetch upstream notes does not fail an otherwise
+successful build.
 
 `custom-core-source.tar.gz` contains the patched source, a dated downstream
 modification notice, and its vendored Go dependencies. The same dependencies are

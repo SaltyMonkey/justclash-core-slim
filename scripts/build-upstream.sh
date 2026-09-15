@@ -24,6 +24,32 @@ fail() {
   exit 2
 }
 
+github_repository_from_url() {
+  local repository="${1%.git}"
+  repository="${repository%/}"
+
+  case "$repository" in
+    https://github.com/*)
+      repository="${repository#https://github.com/}"
+      ;;
+    http://github.com/*)
+      repository="${repository#http://github.com/}"
+      ;;
+    git@github.com:*)
+      repository="${repository#git@github.com:}"
+      ;;
+    ssh://git@github.com/*)
+      repository="${repository#ssh://git@github.com/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  [[ "$repository" == */* && "$repository" != */*/* ]] || return 1
+  printf '%s\n' "$repository"
+}
+
 CHANNEL=""
 UPSTREAM_URL=""
 UPSTREAM_REF=""
@@ -207,10 +233,10 @@ This source tree is an unofficial modified version of MetaCubeX/mihomo.
 - Modification date (UTC): ${MODIFIED_AT}
 - Upstream ref: ${UPSTREAM_REF}
 - Upstream commit: ${UPSTREAM_SHA}
-- Downstream runtime version: ${VERSION}-tiny
+- Downstream runtime version: ${VERSION}-slim
 
 Downstream changes disable EasyTier, Tailscale, and ZeroTier at build time, add
-Linux builds without gVisor, append the \`-tiny\` runtime version suffix, disable
+Linux builds without gVisor, append the \`-slim\` runtime version suffix, disable
 the core self-update API, and prevent the temporary upstream workflow from
 publishing releases or container images.
 
@@ -337,16 +363,77 @@ fi
 )
 
 NOTES="$WORK_DIR/release-notes.txt"
+UPSTREAM_RELEASE_NOTES=""
+UPSTREAM_RELEASE_SHA=""
+UPSTREAM_REPOSITORY=""
+UPSTREAM_WEB_URL="${UPSTREAM_URL%.git}"
+
+if UPSTREAM_REPOSITORY="$(github_repository_from_url "$UPSTREAM_URL")"; then
+  UPSTREAM_WEB_URL="https://github.com/${UPSTREAM_REPOSITORY}"
+  UPSTREAM_RELEASE_REFS=""
+
+  if UPSTREAM_RELEASE_REFS="$(
+    git ls-remote "$UPSTREAM_URL" \
+      "refs/tags/${RELEASE_TAG}" \
+      "refs/tags/${RELEASE_TAG}^{}" 2>/dev/null
+  )"; then
+    UPSTREAM_RELEASE_SHA="$(
+      printf '%s\n' "$UPSTREAM_RELEASE_REFS" \
+        | awk \
+            -v direct="refs/tags/${RELEASE_TAG}" \
+            -v peeled="refs/tags/${RELEASE_TAG}^{}" \
+            '$2 == direct { direct_sha = $1 }
+             $2 == peeled { peeled_sha = $1 }
+             END { print peeled_sha != "" ? peeled_sha : direct_sha }'
+    )"
+  fi
+
+  if [[ "$UPSTREAM_RELEASE_SHA" == "$UPSTREAM_SHA" ]]; then
+    if ! UPSTREAM_RELEASE_NOTES="$(
+      gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+        --jq '.body // empty' 2>/dev/null
+    )"; then
+      echo "Warning: unable to fetch original upstream release notes." >&2
+      UPSTREAM_RELEASE_NOTES=""
+    fi
+  elif [[ -n "$UPSTREAM_RELEASE_SHA" ]]; then
+    echo "Warning: upstream release tag does not match the cloned commit; original release notes are omitted." >&2
+  else
+    echo "Warning: upstream release tag was not found; original release notes are omitted." >&2
+  fi
+else
+  echo "Warning: cannot derive a GitHub repository from --upstream-url; original release notes are omitted." >&2
+fi
+
 {
-  echo "Upstream: MetaCubeX/mihomo"
-  echo "Upstream ref: $UPSTREAM_REF"
-  echo "Upstream SHA: $UPSTREAM_SHA"
-  echo "Patched source SHA: $PATCHED_SHA"
-  echo "Runtime version: ${VERSION}-tiny"
-  echo "Build tags: with_gvisor,no_easytier,no_tailscale,no_zerotier"
+  echo "## Slim build"
+  echo
+  if [[ "$UPSTREAM_WEB_URL" == http://* || "$UPSTREAM_WEB_URL" == https://* ]]; then
+    printf -- '- Upstream: [source repository](%s)\n' "$UPSTREAM_WEB_URL"
+    printf -- '- Upstream commit: [%s](%s/commit/%s)\n' \
+      "$UPSTREAM_SHA" "$UPSTREAM_WEB_URL" "$UPSTREAM_SHA"
+  else
+    echo "- Upstream: $UPSTREAM_URL"
+    echo "- Upstream commit: $UPSTREAM_SHA"
+  fi
+  echo "- Runtime version: ${VERSION}-slim"
+  echo "- Build tags:"
+  echo "  - regular: with_gvisor,no_easytier,no_tailscale,no_zerotier"
+  echo "  - Linux nogvisor: no_easytier,no_tailscale,no_zerotier"
   echo
   echo "Corresponding patched source and vendored Go dependencies are attached as custom-core-source.tar.gz."
   echo "The vendored Go dependencies are also attached separately as vendor.tar.gz."
+
+  if [[ -n "$UPSTREAM_RELEASE_NOTES" ]]; then
+    echo
+    echo "---"
+    echo
+    echo "## Original upstream release notes"
+    echo
+    echo "> These notes describe the original upstream release. EasyTier, Tailscale, and ZeroTier are disabled in this Slim build."
+    echo
+    printf '%s\n' "$UPSTREAM_RELEASE_NOTES"
+  fi
 } > "$NOTES"
 
 # The release tags point to the builder repository, not to a permanent mirror of
