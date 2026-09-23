@@ -74,12 +74,12 @@ a stable release or `alpha-<short-sha>` for an Alpha build. As in the upstream
 workflow, `version.txt` is not included in `checksums.txt`.
 
 Release notes start with a `Slim build` section that links directly to the exact
-upstream commit used for the build. When the upstream release tag resolves to
-that same commit, its original release notes are appended under a separate
-heading. This SHA check prevents a moving Alpha release from contributing notes
-for a different build. The patched source tree is preserved in the attached
-source archive. Failure to fetch upstream notes does not fail an otherwise
-successful build.
+upstream commit, summarizes the downstream changes and lists the available build
+variants. When the upstream release tag resolves to that same commit, its
+original release notes are appended under a separate heading. This SHA check
+prevents a moving Alpha release from contributing notes for a different build.
+The patched source tree is preserved in the attached source archive. Failure to
+fetch upstream notes does not fail an otherwise successful build.
 
 `custom-core-source.tar.gz` contains the patched source, a dated downstream
 modification notice, and its vendored Go dependencies. The same dependencies are
@@ -101,6 +101,8 @@ release as well as being included in the source archive.
   Docker jobs; publishing is handled by the builder workflow.
 - `patches/0004-disable-core-self-update.patch` — disables only the core
   self-update API; UI and GEO database updates remain available.
+- `patches/0005-use-utls-v1.9.0-mod-meta.patch` — pins MetaCubeX/utls to the
+  `v1.9.0-mod-meta` branch revision.
 - `scripts/build-upstream.sh` — creates the temporary source branch, dispatches
   the original CI, waits for it, publishes assets, then removes that branch.
 
@@ -138,17 +140,6 @@ Actions bot identity by default. Manual callers can override it with
 `--git-user-name` and `--git-user-email`. These values are applied only to the
 single `git commit-tree` invocation; the cloned repository's Git configuration
 is not modified.
-
-## Schedule
-
-The workflow runs at:
-
-`30 2 * * *`
-
-GitHub cron is UTC.
-
-You can also run `Sync upstream builds` manually. The manual form contains
-switches to force an Alpha or stable rebuild.
 
 ## Patch safety and reproducibility
 

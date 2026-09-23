@@ -235,10 +235,11 @@ This source tree is an unofficial modified version of MetaCubeX/mihomo.
 - Upstream commit: ${UPSTREAM_SHA}
 - Downstream runtime version: ${VERSION}-slim
 
-Downstream changes disable EasyTier, Tailscale, and ZeroTier at build time, add
-Linux builds without gVisor, append the \`-slim\` runtime version suffix, disable
-the core self-update API, and prevent the temporary upstream workflow from
-publishing releases or container images.
+Downstream changes disable EasyTier, Tailscale, and ZeroTier at build time, pin
+MetaCubeX/utls to the v1.9.0-mod-meta branch revision, add Linux builds without
+gVisor, append the \`-slim\` runtime version suffix, disable the core self-update
+API, and prevent the temporary upstream workflow from publishing releases or
+container images.
 
 This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
 license text. Original copyright and license notices remain in effect.
@@ -408,21 +409,34 @@ fi
 {
   echo "## Slim build"
   echo
+  echo "Unofficial downstream build based on MetaCubeX/mihomo."
+  echo
   if [[ "$UPSTREAM_WEB_URL" == http://* || "$UPSTREAM_WEB_URL" == https://* ]]; then
-    printf -- '- Upstream: [source repository](%s)\n' "$UPSTREAM_WEB_URL"
+    printf -- '- Upstream source: [MetaCubeX/mihomo](%s)\n' "$UPSTREAM_WEB_URL"
     printf -- '- Upstream commit: [%s](%s/commit/%s)\n' \
       "$UPSTREAM_SHA" "$UPSTREAM_WEB_URL" "$UPSTREAM_SHA"
   else
-    echo "- Upstream: $UPSTREAM_URL"
+    echo "- Upstream source: $UPSTREAM_URL"
     echo "- Upstream commit: $UPSTREAM_SHA"
   fi
   echo "- Runtime version: ${VERSION}-slim"
-  echo "- Build tags:"
-  echo "  - regular: with_gvisor,no_easytier,no_tailscale,no_zerotier"
-  echo "  - Linux nogvisor: no_easytier,no_tailscale,no_zerotier"
   echo
-  echo "Corresponding patched source and vendored Go dependencies are attached as custom-core-source.tar.gz."
-  echo "The vendored Go dependencies are also attached separately as vendor.tar.gz."
+  echo "### Downstream changes"
+  echo
+  echo "- EasyTier, Tailscale, and ZeroTier are excluded at build time."
+  echo "- [MetaCubeX/utls v1.9.0-mod-meta](https://github.com/MetaCubeX/utls/tree/v1.9.0-mod-meta) is pinned to commit [2aa631698733](https://github.com/MetaCubeX/utls/commit/2aa631698733a602acb2d998b9e7df2e6a446dd2)."
+  echo "- Core self-update is disabled; UI and GEO database updates remain available."
+  echo "- The runtime version carries the \`-slim\` suffix."
+  echo
+  echo "### Build variants"
+  echo
+  echo "- Standard: \`with_gvisor,no_easytier,no_tailscale,no_zerotier\`"
+  echo "- Linux without gVisor: \`no_easytier,no_tailscale,no_zerotier\`"
+  echo
+  echo "### Source and dependencies"
+  echo
+  echo "- \`custom-core-source.tar.gz\` contains the corresponding patched source and vendored Go dependencies."
+  echo "- \`vendor.tar.gz\` contains the vendored Go dependencies separately."
 
   if [[ -n "$UPSTREAM_RELEASE_NOTES" ]]; then
     echo
