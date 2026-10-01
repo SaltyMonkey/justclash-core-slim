@@ -5,7 +5,7 @@ diff --git a/go.mod b/go.mod
  	github.com/metacubex/tfo-go v0.0.0-20260623020846-376a77860b8c
  	github.com/metacubex/tls v0.1.8
 -	github.com/metacubex/utls v1.8.8
-+	github.com/metacubex/utls v0.0.0-20260726054410-2aa631698733
++	github.com/metacubex/utls v0.0.0-20260930132604-78c9290bf587
  	github.com/metacubex/wireguard-go v0.0.0-20250820062549-a6cecdd7f57f
  	github.com/metacubex/zerotier-go v0.0.0-20260813124750-13fa6f45da5f
  	github.com/mroth/weightedrand/v2 v2.1.0
@@ -17,7 +17,7 @@ diff --git a/go.sum b/go.sum
  github.com/metacubex/tls v0.1.8/go.mod h1:0XeVdL0cBw+8i5Hqy3lVeP9IyD/LFTq02ExvHM6rzEM=
 -github.com/metacubex/utls v1.8.8 h1:7fiMYahL+tT1I/vG1MWidv88r/3A5NnPrurjzApZGyQ=
 -github.com/metacubex/utls v1.8.8/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
-+github.com/metacubex/utls v0.0.0-20260726054410-2aa631698733 h1:YZaGbI5B/14ILkTgmrAteft67m/5xlRWoeobnNxvejY=
-+github.com/metacubex/utls v0.0.0-20260726054410-2aa631698733/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
++github.com/metacubex/utls v0.0.0-20260930132604-78c9290bf587 h1:UhLgz5tO65pDSNMOnQiHVDLFTNkr4l3TaS6OQ8MSYXI=
++github.com/metacubex/utls v0.0.0-20260930132604-78c9290bf587/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
  github.com/metacubex/wazero v0.0.0-20260628025728-9ae6bdcf2a7d h1:UMFI+kdp0jA8s9tC7oul0pWeTW6s8lnm0dD5PT+RY14=
  github.com/metacubex/wazero v0.0.0-20260628025728-9ae6bdcf2a7d/go.mod h1:p48xp436h1oGfoXuEnVONeDhTW+E2UpY94GAVxA62oI=
