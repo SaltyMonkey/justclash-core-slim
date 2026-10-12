@@ -54,7 +54,10 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --json body \
               --jq '.body' 2>/dev/null |
-            sed -n 's/^Upstream SHA: //p' |
+            # Accept linked and plain commit notes.
+            sed -n \
+              -e 's/^- Upstream commit: \[\([0-9a-f]\{40\}\)\].*$/\1/p' \
+              -e 's/^- Upstream commit: \([0-9a-f]\{40\}\)$/\1/p' |
             head -n1 || true
           )"
 
