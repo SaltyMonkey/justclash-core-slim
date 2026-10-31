@@ -424,7 +424,7 @@ fi
   echo "### Downstream changes"
   echo
   echo "- EasyTier, Tailscale, and ZeroTier are excluded at build time."
-  echo "- [MetaCubeX/utls v1.9.0-mod-meta](https://github.com/MetaCubeX/utls/tree/v1.9.0-mod-meta) is pinned to commit [d4150a6c7c06](https://github.com/MetaCubeX/utls/commit/d4150a6c7c06120e295244bd948168c09e84e41e)."
+  echo "- [MetaCubeX/utls v1.9.0-mod-meta](https://github.com/MetaCubeX/utls/tree/v1.9.0-mod-meta) is pinned to commit [a6a364afbd13](https://github.com/MetaCubeX/utls/commit/a6a364afbd13015e2d6da7d55f8ad4123f9fc0b9)."
   echo "- Core self-update is disabled; UI and GEO database updates remain available."
   echo "- The runtime version carries the \`-slim\` suffix."
   echo
