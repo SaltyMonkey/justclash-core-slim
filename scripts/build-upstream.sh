@@ -235,11 +235,38 @@ This source tree is an unofficial modified version of MetaCubeX/mihomo.
 - Upstream commit: ${UPSTREAM_SHA}
 - Downstream runtime version: ${VERSION}-slim
 
-Downstream changes disable EasyTier, Tailscale, and ZeroTier at build time, pin
-MetaCubeX/utls to the v1.9.0-mod-meta branch revision, add Linux builds without
-gVisor, append the \`-slim\` runtime version suffix, disable the core self-update
-API, and prevent the temporary upstream workflow from publishing releases or
-container images.
+Downstream changes disable EasyTier, Tailscale, and ZeroTier at build time and
+exclude TrustTunnel, Hysteria 1, ShadowQUIC, OpenVPN, and ShadowsocksR
+implementations using build tags and provide explicit disabled-feature errors.
+Inbound implementations are also excluded where those protocols provide them.
+The original implementation files remain in the source. Hysteria 2 and ordinary
+Shadowsocks and Snell remain available. HTTP /debug endpoints are excluded while
+ordinary logging, the REST API, and the UI remain available. Every target has a single
+build without gVisor; the MIP stack is preserved. These changes pin MetaCubeX/utls
+to the v1.9.0-mod-meta branch revision, append the \`-slim\` runtime version suffix,
+disable the core self-update API, and prevent the temporary upstream workflow
+from publishing releases or container images.
+
+TUN stack selection accepts only mips and system. Unsupported gvisor/mixed TUN
+settings are rejected while decoding configuration; HTTP/SOCKS mixed listeners
+remain available.
+
+GET /connections/count returns the active connection count without creating a
+full snapshot. WebSocket requests stream the same count with a configurable
+interval under the existing API authentication.
+
+Proxy providers skip nodes using protocols excluded from this build and emit a
+warning. Other configuration errors remain fatal; updates with no usable nodes
+do not replace the previous provider list.
+
+SOCKS5 supports opt-in resolve-destination for TCP through the existing core DNS
+resolver. UDP retains its existing local-resolution behavior, and DNS transports
+use the existing bootstrap resolver before entering a local-resolving SOCKS5
+outbound.
+
+The downstream resolve-destination option is disabled by default. Destination
+lookups use the main DNS resolver rather than the DIRECT or proxy-server DNS
+policies; the proxy-server resolver still resolves the SOCKS server itself.
 
 This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
 license text. Original copyright and license notices remain in effect.
@@ -424,14 +451,21 @@ fi
   echo "### Downstream changes"
   echo
   echo "- EasyTier, Tailscale, and ZeroTier are excluded at build time."
+  echo "- TrustTunnel, Hysteria 1, ShadowQUIC, OpenVPN, and ShadowsocksR are disabled, including their inbounds where provided."
+  echo "- Hysteria 2, ordinary Shadowsocks, Snell, and static TCP/UDP tunnels remain available."
+  echo "- HTTP /debug endpoints (pprof, vars, and manual GC) are excluded; ordinary logging, the API, and UI remain available."
+  echo "- All targets are built without gVisor; the MIP stack remains available."
+  echo "- TUN accepts mips (default) and system; gvisor/mixed are removed from the TUN stack mapping. HTTP/SOCKS mixed listeners remain available."
   echo "- [MetaCubeX/utls v1.9.0-mod-meta](https://github.com/MetaCubeX/utls/tree/v1.9.0-mod-meta) is pinned to commit [a6a364afbd13](https://github.com/MetaCubeX/utls/commit/a6a364afbd13015e2d6da7d55f8ad4123f9fc0b9)."
   echo "- Core self-update is disabled; UI and GEO database updates remain available."
+  echo "- HTTP and WebSocket \`/connections/count\` provide the active connection count without full snapshots."
+  echo "- SOCKS5 supports optional \`resolve-destination: true\` through the existing core DNS resolver."
+  echo "- Proxy providers skip build-disabled protocols with a warning; other parse errors remain fatal and empty updates preserve the previous list."
   echo "- The runtime version carries the \`-slim\` suffix."
   echo
-  echo "### Build variants"
+  echo "### Build profile"
   echo
-  echo "- Standard: \`with_gvisor,no_easytier,no_tailscale,no_zerotier\`"
-  echo "- Linux without gVisor: \`no_easytier,no_tailscale,no_zerotier\`"
+  echo "- Single build without gVisor: \`no_easytier,no_tailscale,no_zerotier,no_trusttunnel,no_hysteria1,no_shadowquic,no_openvpn,no_shadowsocksr,no_debug_http\`"
   echo
   echo "### Source and dependencies"
   echo
@@ -444,7 +478,7 @@ fi
     echo
     echo "## Original upstream release notes"
     echo
-    echo "> These notes describe the original upstream release. EasyTier, Tailscale, and ZeroTier are disabled in this Slim build."
+    echo "> These notes describe the original upstream release. EasyTier, Tailscale, ZeroTier, TrustTunnel, Hysteria 1, ShadowQUIC, OpenVPN, and ShadowsocksR are disabled in this Slim build."
     echo
     printf '%s\n' "$UPSTREAM_RELEASE_NOTES"
   fi
