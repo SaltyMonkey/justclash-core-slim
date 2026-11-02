@@ -1,0 +1,69 @@
+diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
+--- a/adapter/outbound/shadowsocksr.go
++++ b/adapter/outbound/shadowsocksr.go
+@@ -1,3 +1,5 @@
++//go:build !no_shadowsocksr
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/shadowsocksr_disabled_test.go b/adapter/outbound/shadowsocksr_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/shadowsocksr_disabled_test.go
+@@ -0,0 +1,21 @@
++//go:build no_shadowsocksr
++
++package outbound_test
++
++import (
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/adapter/outbound"
++	"strings"
++	"testing"
++)
++
++func TestSlimShadowSocksRDisabled(t *testing.T) {
++	proxy, err := outbound.NewShadowSocksR(outbound.ShadowSocksROption{})
++	if proxy != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatal("disabled outbound must reject configuration before creating resources")
++	}
++	parsed, err := adapter.ParseProxy(map[string]any{"name": "disabled-test", "type": "ssr", "server": "", "port": 0, "password": "", "cipher": "", "obfs": "", "protocol": "", "up": "", "down": "", "ca": "", "psk": ""})
++	if parsed != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatalf("proxy parser must report a disabled protocol: %v", err)
++	}
++}
+diff --git a/adapter/outbound/shadowsocksr_stub.go b/adapter/outbound/shadowsocksr_stub.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/shadowsocksr_stub.go
+@@ -0,0 +1,29 @@
++//go:build no_shadowsocksr
++
++package outbound
++
++import (
++	"errors"
++)
++
++// Keep decoding intact; disabled protocols do not need a mystery error tour.
++type ShadowSocksR struct{ *Base }
++type ShadowSocksROption struct {
++	BasicOption
++	Name          string `proxy:"name"`
++	Server        string `proxy:"server"`
++	Port          int    `proxy:"port"`
++	Password      string `proxy:"password"`
++	Cipher        string `proxy:"cipher"`
++	Obfs          string `proxy:"obfs"`
++	ObfsParam     string `proxy:"obfs-param,omitempty"`
++	Protocol      string `proxy:"protocol"`
++	ProtocolParam string `proxy:"protocol-param,omitempty"`
++	UDP           bool   `proxy:"udp,omitempty"`
++}
++
++func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
++	return nil, errors.New("ShadowSocksR support is disabled in slim builds")
++}
++
++var _ ProxyAdapter = (*ShadowSocksR)(nil)

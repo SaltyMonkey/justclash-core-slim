@@ -1,0 +1,55 @@
+diff --git a/constant/tun.go b/constant/tun.go
+--- a/constant/tun.go
++++ b/constant/tun.go
+@@ -6,9 +6,7 @@
+ )
+ 
+ var StackTypeMapping = map[string]TUNStack{
+-	strings.ToLower(TunGvisor.String()): TunGvisor,
+ 	strings.ToLower(TunSystem.String()): TunSystem,
+-	strings.ToLower(TunMixed.String()):  TunMixed,
+ 	strings.ToLower(TunMips.String()):   TunMips,
+ }
+ 
+diff --git a/constant/tun_stack_test.go b/constant/tun_stack_test.go
+new file mode 100644
+--- /dev/null
++++ b/constant/tun_stack_test.go
+@@ -0,0 +1,37 @@
++package constant
++
++import (
++	"encoding/json"
++	"testing"
++
++	"go.yaml.in/yaml/v3"
++)
++
++func TestSlimTUNStackConfiguration(t *testing.T) {
++	cases := []struct {
++		name  string
++		want  TUNStack
++		valid bool
++	}{
++		{"system", TunSystem, true},
++		{"mips", TunMips, true},
++		{"MiPs", TunMips, true},
++		{"gvisor", 0, false},
++		{"mixed", 0, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			var j, y struct {
++				Stack TUNStack `json:"stack" yaml:"stack"`
++			}
++			jerr := json.Unmarshal([]byte(`{"stack":"`+tc.name+`"}`), &j)
++			yerr := yaml.Unmarshal([]byte("stack: "+tc.name+"\n"), &y)
++			if (jerr == nil) != tc.valid || (yerr == nil) != tc.valid {
++				t.Fatal("unexpected stack acceptance in YAML/JSON")
++			}
++			if tc.valid && (j.Stack != tc.want || y.Stack != tc.want) {
++				t.Fatal("stack value changed during decoding")
++			}
++		})
++	}
++}

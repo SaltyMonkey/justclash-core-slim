@@ -1,0 +1,162 @@
+diff --git a/adapter/outbound/trusttunnel.go b/adapter/outbound/trusttunnel.go
+--- a/adapter/outbound/trusttunnel.go
++++ b/adapter/outbound/trusttunnel.go
+@@ -1,3 +1,5 @@
++//go:build !no_trusttunnel
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/trusttunnel_disabled_test.go b/adapter/outbound/trusttunnel_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/trusttunnel_disabled_test.go
+@@ -0,0 +1,21 @@
++//go:build no_trusttunnel
++
++package outbound_test
++
++import (
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/adapter/outbound"
++	"strings"
++	"testing"
++)
++
++func TestSlimTrustTunnelDisabled(t *testing.T) {
++	proxy, err := outbound.NewTrustTunnel(outbound.TrustTunnelOption{})
++	if proxy != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatal("disabled outbound must reject configuration before creating resources")
++	}
++	parsed, err := adapter.ParseProxy(map[string]any{"name": "disabled-test", "type": "trusttunnel", "server": "", "port": 0, "password": "", "cipher": "", "obfs": "", "protocol": "", "up": "", "down": "", "ca": "", "psk": ""})
++	if parsed != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatalf("proxy parser must report a disabled protocol: %v", err)
++	}
++}
+diff --git a/adapter/outbound/trusttunnel_stub.go b/adapter/outbound/trusttunnel_stub.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/trusttunnel_stub.go
+@@ -0,0 +1,44 @@
++//go:build no_trusttunnel
++
++package outbound
++
++import (
++	"errors"
++)
++
++// Keep decoding intact; disabled protocols do not need a mystery error tour.
++type TrustTunnel struct{ *Base }
++type TrustTunnelOption struct {
++	BasicOption
++	Name              string     `proxy:"name"`
++	Server            string     `proxy:"server"`
++	Port              int        `proxy:"port"`
++	UserName          string     `proxy:"username,omitempty"`
++	Password          string     `proxy:"password,omitempty"`
++	ALPN              []string   `proxy:"alpn,omitempty"`
++	SNI               string     `proxy:"sni,omitempty"`
++	ECHOpts           ECHOptions `proxy:"ech-opts,omitempty"`
++	ClientFingerprint string     `proxy:"client-fingerprint,omitempty"`
++	SkipCertVerify    bool       `proxy:"skip-cert-verify,omitempty"`
++	NameCertVerify    string     `proxy:"name-cert-verify,omitempty"`
++	Fingerprint       string     `proxy:"fingerprint,omitempty"`
++	Certificate       string     `proxy:"certificate,omitempty"`
++	PrivateKey        string     `proxy:"private-key,omitempty"`
++	UDP               bool       `proxy:"udp,omitempty"`
++	HealthCheck       bool       `proxy:"health-check,omitempty"`
++	// quic options
++	Quic                 bool   `proxy:"quic,omitempty"`
++	CongestionController string `proxy:"congestion-controller,omitempty"`
++	CWND                 int    `proxy:"cwnd,omitempty"`
++	BBRProfile           string `proxy:"bbr-profile,omitempty"`
++	// reuse options
++	MaxConnections int `proxy:"max-connections,omitempty"`
++	MinStreams     int `proxy:"min-streams,omitempty"`
++	MaxStreams     int `proxy:"max-streams,omitempty"`
++}
++
++func NewTrustTunnel(option TrustTunnelOption) (*TrustTunnel, error) {
++	return nil, errors.New("TrustTunnel support is disabled in slim builds")
++}
++
++var _ ProxyAdapter = (*TrustTunnel)(nil)
+diff --git a/listener/inbound/trusttunnel.go b/listener/inbound/trusttunnel.go
+--- a/listener/inbound/trusttunnel.go
++++ b/listener/inbound/trusttunnel.go
+@@ -1,3 +1,5 @@
++//go:build !no_trusttunnel
++
+ package inbound
+ 
+ import (
+diff --git a/listener/inbound/trusttunnel_disabled_test.go b/listener/inbound/trusttunnel_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/listener/inbound/trusttunnel_disabled_test.go
+@@ -0,0 +1,16 @@
++//go:build no_trusttunnel
++
++package inbound_test
++
++import (
++	IN "github.com/metacubex/mihomo/listener/inbound"
++	"strings"
++	"testing"
++)
++
++func TestSlimTrustTunnelDisabled(t *testing.T) {
++	listener, err := IN.NewTrustTunnel(&IN.TrustTunnelOption{})
++	if listener != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatal("disabled inbound must reject configuration before creating resources")
++	}
++}
+diff --git a/listener/inbound/trusttunnel_stub.go b/listener/inbound/trusttunnel_stub.go
+new file mode 100644
+--- /dev/null
++++ b/listener/inbound/trusttunnel_stub.go
+@@ -0,0 +1,34 @@
++//go:build no_trusttunnel
++
++package inbound
++
++import (
++	"errors"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type TrustTunnelOption struct {
++	BaseOption
++	Users                AuthUsers `inbound:"users,omitempty"`
++	Certificate          string    `inbound:"certificate"`
++	PrivateKey           string    `inbound:"private-key"`
++	ClientAuthType       string    `inbound:"client-auth-type,omitempty"`
++	ClientAuthCert       string    `inbound:"client-auth-cert,omitempty"`
++	EchKey               string    `inbound:"ech-key,omitempty"`
++	Network              []string  `inbound:"network,omitempty"`
++	CongestionController string    `inbound:"congestion-controller,omitempty"`
++	CWND                 int       `inbound:"cwnd,omitempty"`
++	BBRProfile           string    `inbound:"bbr-profile,omitempty"`
++}
++
++func (o TrustTunnelOption) Equal(config C.InboundConfig) bool {
++	return optionToString(o) == optionToString(config)
++}
++
++type TrustTunnel struct{ *Base }
++
++func NewTrustTunnel(options *TrustTunnelOption) (*TrustTunnel, error) {
++	return nil, errors.New("TrustTunnel support is disabled in slim builds")
++}
++
++var _ C.InboundListener = (*TrustTunnel)(nil)
+diff --git a/listener/inbound/trusttunnel_test.go b/listener/inbound/trusttunnel_test.go
+--- a/listener/inbound/trusttunnel_test.go
++++ b/listener/inbound/trusttunnel_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_trusttunnel
++
+ package inbound_test
+ 
+ import (

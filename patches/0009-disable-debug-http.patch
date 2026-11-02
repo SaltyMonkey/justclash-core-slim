@@ -1,0 +1,161 @@
+diff --git a/hub/route/debug_http.go b/hub/route/debug_http.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/debug_http.go
+@@ -0,0 +1,24 @@
++//go:build !no_debug_http
++
++package route
++
++import (
++	"github.com/metacubex/chi"
++	"github.com/metacubex/chi/middleware"
++	"github.com/metacubex/http"
++	"runtime/debug"
++)
++
++func mountDebugHTTP(r chi.Router, isDebug bool) {
++	if isDebug {
++		r.Mount("/debug", func() http.Handler {
++			r := chi.NewRouter()
++			r.Put("/gc", func(w http.ResponseWriter, r *http.Request) {
++				debug.FreeOSMemory()
++			})
++			handler := middleware.Profiler
++			r.Mount("/", handler())
++			return r
++		}())
++	}
++}
+diff --git a/hub/route/debug_http_common_test.go b/hub/route/debug_http_common_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/debug_http_common_test.go
+@@ -0,0 +1,52 @@
++package route
++
++import (
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func checkDebugHTTPRoutes(t *testing.T, debugAvailable bool) {
++	t.Helper()
++	previousUI := uiPath
++	uiPath = t.TempDir()
++	t.Cleanup(func() { uiPath = previousUI })
++	if err := os.WriteFile(filepath.Join(uiPath, "index.html"), []byte("audit-ui"), 0600); err != nil {
++		t.Fatal("fixture creation failed")
++	}
++	for _, debugOn := range []bool{false, true} {
++		r := router(debugOn, "", "", Cors{})
++		for _, path := range []string{"/", "/version", "/ui/", "/debug/pprof/", "/debug/vars", "/debug/gc"} {
++			method := http.MethodGet
++			if path == "/debug/gc" {
++				method = http.MethodPut
++			}
++			want := http.StatusOK
++			isDebugPath := path == "/debug/pprof/" || path == "/debug/vars" || path == "/debug/gc"
++			if isDebugPath && (!debugOn || !debugAvailable) {
++				want = http.StatusNotFound
++			}
++			recorder := httptest.NewRecorder()
++			r.ServeHTTP(recorder, httptest.NewRequest(method, path, nil))
++			if recorder.Code != want {
++				t.Errorf("%s debug=%t status=%d want=%d", path, debugOn, recorder.Code, want)
++			}
++		}
++	}
++	r := router(true, t.Name(), "", Cors{})
++	request := httptest.NewRequest(http.MethodGet, "/version", nil)
++	recorder := httptest.NewRecorder()
++	r.ServeHTTP(recorder, request)
++	if recorder.Code != http.StatusUnauthorized {
++		t.Fatal("API authentication must remain active")
++	}
++	request = httptest.NewRequest(http.MethodGet, "/version", nil)
++	request.Header.Set("Authorization", "Bearer "+t.Name())
++	recorder = httptest.NewRecorder()
++	r.ServeHTTP(recorder, request)
++	if recorder.Code != http.StatusOK {
++		t.Fatal("authenticated API must remain available")
++	}
++}
+diff --git a/hub/route/debug_http_enabled_test.go b/hub/route/debug_http_enabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/debug_http_enabled_test.go
+@@ -0,0 +1,7 @@
++//go:build !no_debug_http
++
++package route
++
++import "testing"
++
++func TestDebugHTTPEnabled(t *testing.T) { checkDebugHTTPRoutes(t, true) }
+diff --git a/hub/route/debug_http_stub.go b/hub/route/debug_http_stub.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/debug_http_stub.go
+@@ -0,0 +1,8 @@
++//go:build no_debug_http
++
++package route
++
++import "github.com/metacubex/chi"
++
++// Debug logging does not need to bring an HTTP profiler along for the ride.
++func mountDebugHTTP(_ chi.Router, _ bool) {}
+diff --git a/hub/route/debug_http_stub_test.go b/hub/route/debug_http_stub_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/debug_http_stub_test.go
+@@ -0,0 +1,7 @@
++//go:build no_debug_http
++
++package route
++
++import "testing"
++
++func TestDebugHTTPDisabled(t *testing.T) { checkDebugHTTPRoutes(t, false) }
+diff --git a/hub/route/server.go b/hub/route/server.go
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -8,7 +8,6 @@
+ 	"net"
+ 	"os"
+ 	"path/filepath"
+-	"runtime/debug"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+@@ -24,7 +23,6 @@
+ 
+ 	"github.com/metacubex/chi"
+ 	"github.com/metacubex/chi/cors"
+-	"github.com/metacubex/chi/middleware"
+ 	"github.com/metacubex/chi/render"
+ 	"github.com/metacubex/http"
+ 	"github.com/metacubex/tls"
+@@ -105,17 +103,7 @@
+ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
+ 	r := chi.NewRouter()
+ 	cors.Apply(r)
+-	if isDebug {
+-		r.Mount("/debug", func() http.Handler {
+-			r := chi.NewRouter()
+-			r.Put("/gc", func(w http.ResponseWriter, r *http.Request) {
+-				debug.FreeOSMemory()
+-			})
+-			handler := middleware.Profiler
+-			r.Mount("/", handler())
+-			return r
+-		}())
+-	}
++	mountDebugHTTP(r, isDebug)
+ 	r.Group(func(r chi.Router) {
+ 		if secret != "" {
+ 			r.Use(authentication(secret))

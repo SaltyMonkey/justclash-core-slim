@@ -1,0 +1,284 @@
+diff --git a/adapter/outbound/easytier_stub.go b/adapter/outbound/easytier_stub.go
+--- a/adapter/outbound/easytier_stub.go
++++ b/adapter/outbound/easytier_stub.go
+@@ -2,7 +2,7 @@
+ 
+ package outbound
+ 
+-import "fmt"
++import C "github.com/metacubex/mihomo/constant"
+ 
+ type EasyTier struct {
+ 	*Base
+@@ -44,5 +44,5 @@
+ }
+ 
+ func NewEasyTier(EasyTierOption) (*EasyTier, error) {
+-	return nil, fmt.Errorf("EasyTier support is disabled by \"no_easytier\" build tag")
++	return nil, C.DisabledProtocolError("EasyTier support is disabled by \"no_easytier\" build tag")
+ }
+diff --git a/adapter/outbound/tailscale_stub.go b/adapter/outbound/tailscale_stub.go
+--- a/adapter/outbound/tailscale_stub.go
++++ b/adapter/outbound/tailscale_stub.go
+@@ -2,7 +2,7 @@
+ 
+ package outbound
+ 
+-import "fmt"
++import C "github.com/metacubex/mihomo/constant"
+ 
+ type Tailscale struct {
+ 	*Base
+@@ -24,5 +24,5 @@
+ }
+ 
+ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
+-	return nil, fmt.Errorf("tailscale support is disabled by \"no_tailscale\" build tag or not include \"with_gvisor\" build tag")
++	return nil, C.DisabledProtocolError("tailscale support is disabled by \"no_tailscale\" build tag or not include \"with_gvisor\" build tag")
+ }
+diff --git a/adapter/outbound/zerotier_stub.go b/adapter/outbound/zerotier_stub.go
+--- a/adapter/outbound/zerotier_stub.go
++++ b/adapter/outbound/zerotier_stub.go
+@@ -2,7 +2,7 @@
+ 
+ package outbound
+ 
+-import "fmt"
++import C "github.com/metacubex/mihomo/constant"
+ 
+ type ZeroTier struct {
+ 	*Base
+@@ -38,5 +38,5 @@
+ }
+ 
+ func NewZeroTier(ZeroTierOption) (*ZeroTier, error) {
+-	return nil, fmt.Errorf("ZeroTier support is disabled by \"no_zerotier\" build tag")
++	return nil, C.DisabledProtocolError("ZeroTier support is disabled by \"no_zerotier\" build tag")
+ }
+diff --git a/adapter/outbound/trusttunnel_stub.go b/adapter/outbound/trusttunnel_stub.go
+--- a/adapter/outbound/trusttunnel_stub.go
++++ b/adapter/outbound/trusttunnel_stub.go
+@@ -3,7 +3,7 @@
+ package outbound
+ 
+ import (
+-	"errors"
++	C "github.com/metacubex/mihomo/constant"
+ )
+ 
+ // Keep decoding intact; disabled protocols do not need a mystery error tour.
+@@ -38,7 +38,7 @@
+ }
+ 
+ func NewTrustTunnel(option TrustTunnelOption) (*TrustTunnel, error) {
+-	return nil, errors.New("TrustTunnel support is disabled in slim builds")
++	return nil, C.DisabledProtocolError("TrustTunnel support is disabled in slim builds")
+ }
+ 
+ var _ ProxyAdapter = (*TrustTunnel)(nil)
+diff --git a/adapter/outbound/hysteria_stub.go b/adapter/outbound/hysteria_stub.go
+--- a/adapter/outbound/hysteria_stub.go
++++ b/adapter/outbound/hysteria_stub.go
+@@ -2,7 +2,7 @@
+ 
+ package outbound
+ 
+-import "errors"
++import C "github.com/metacubex/mihomo/constant"
+ 
+ // Keep decoding intact; disabled protocols do not need a mystery error tour.
+ type Hysteria struct{ *Base }
+@@ -37,6 +37,7 @@
+ }
+ 
+ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
+-	return nil, errors.New("Hysteria support is disabled in slim builds")
++	return nil, C.DisabledProtocolError("Hysteria support is disabled in slim builds")
+ }
++
+ var _ ProxyAdapter = (*Hysteria)(nil)
+diff --git a/adapter/outbound/shadowquic_stub.go b/adapter/outbound/shadowquic_stub.go
+--- a/adapter/outbound/shadowquic_stub.go
++++ b/adapter/outbound/shadowquic_stub.go
+@@ -3,7 +3,7 @@
+ package outbound
+ 
+ import (
+-	"errors"
++	C "github.com/metacubex/mihomo/constant"
+ )
+ 
+ // Keep decoding intact; disabled protocols do not need a mystery error tour.
+@@ -34,7 +34,7 @@
+ }
+ 
+ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
+-	return nil, errors.New("ShadowQuic support is disabled in slim builds")
++	return nil, C.DisabledProtocolError("ShadowQuic support is disabled in slim builds")
+ }
+ 
+ var _ ProxyAdapter = (*ShadowQuic)(nil)
+diff --git a/adapter/outbound/openvpn_stub.go b/adapter/outbound/openvpn_stub.go
+--- a/adapter/outbound/openvpn_stub.go
++++ b/adapter/outbound/openvpn_stub.go
+@@ -3,7 +3,7 @@
+ package outbound
+ 
+ import (
+-	"errors"
++	C "github.com/metacubex/mihomo/constant"
+ )
+ 
+ // Keep decoding intact; disabled protocols do not need a mystery error tour.
+@@ -44,7 +44,7 @@
+ }
+ 
+ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
+-	return nil, errors.New("OpenVPN support is disabled in slim builds")
++	return nil, C.DisabledProtocolError("OpenVPN support is disabled in slim builds")
+ }
+ 
+ var _ ProxyAdapter = (*OpenVPN)(nil)
+diff --git a/adapter/outbound/shadowsocksr_stub.go b/adapter/outbound/shadowsocksr_stub.go
+--- a/adapter/outbound/shadowsocksr_stub.go
++++ b/adapter/outbound/shadowsocksr_stub.go
+@@ -3,7 +3,7 @@
+ package outbound
+ 
+ import (
+-	"errors"
++	C "github.com/metacubex/mihomo/constant"
+ )
+ 
+ // Keep decoding intact; disabled protocols do not need a mystery error tour.
+@@ -23,7 +23,7 @@
+ }
+ 
+ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
+-	return nil, errors.New("ShadowSocksR support is disabled in slim builds")
++	return nil, C.DisabledProtocolError("ShadowSocksR support is disabled in slim builds")
+ }
+ 
+ var _ ProxyAdapter = (*ShadowSocksR)(nil)
+diff --git a/adapter/provider/provider.go b/adapter/provider/provider.go
+--- a/adapter/provider/provider.go
++++ b/adapter/provider/provider.go
+@@ -18,6 +18,7 @@
+ 	"github.com/metacubex/mihomo/component/resource"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/metacubex/mihomo/log"
+ 	"github.com/metacubex/mihomo/tunnel/statistic"
+ 
+ 	"github.com/dlclark/regexp2"
+@@ -448,6 +449,11 @@
+ 
+ 				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
+ 				if err != nil {
++					var disabled C.DisabledProtocolError
++					if errors.As(err, &disabled) {
++						log.Warnln("[Provider] %s: skip proxy %d: %s", pdName, idx, disabled)
++						continue
++					}
+ 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
+ 				}
+ 
+diff --git a/constant/disabled_protocol.go b/constant/disabled_protocol.go
+new file mode 100644
+--- /dev/null
++++ b/constant/disabled_protocol.go
+@@ -0,0 +1,7 @@
++package constant
++
++// DisabledProtocolError marks a protocol excluded from this build.
++// Providers can skip it without treating every typo as a disabled feature.
++type DisabledProtocolError string
++
++func (e DisabledProtocolError) Error() string { return string(e) }
+diff --git a/adapter/provider/disabled_protocol_test.go b/adapter/provider/disabled_protocol_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/provider/disabled_protocol_test.go
+@@ -0,0 +1,82 @@
++//go:build no_hysteria1
++
++package provider
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/common/yaml"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestProviderDisabledProtocol(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		nodes     []map[string]any
++		want      []string
++		wantError bool
++	}{
++		{
++			name: "mixed",
++			nodes: []map[string]any{
++				{"name": "first", "type": "direct"},
++				{"name": "disabled", "type": "hysteria", "server": "", "up": "", "down": ""},
++				{"name": "last", "type": "direct"},
++			},
++			want: []string{"first", "last"},
++		},
++		{name: "all-disabled", nodes: []map[string]any{{"name": "disabled", "type": "hysteria", "server": "", "up": "", "down": ""}}, wantError: true},
++		{
++			name: "ordinary-error-is-fatal",
++			nodes: []map[string]any{
++				{"name": "first", "type": "direct"},
++				{"name": "bad", "type": "unknown-test-protocol"},
++			},
++			wantError: true,
++		},
++		{
++			name:      "decode-error-is-fatal",
++			nodes:     []map[string]any{{"name": "bad", "type": "socks5", "server": "", "port": map[string]any{"invalid": true}}},
++			wantError: true,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			parse, err := NewProxiesParser(t.Name(), nil, "", "", "", "", overrideSchema{}, "")
++			if err != nil {
++				t.Fatal("provider parser construction failed")
++			}
++			buf, err := yaml.Marshal(ProxySchema{Proxies: tc.nodes})
++			if err != nil {
++				t.Fatal("test payload encoding failed")
++			}
++			proxies, err := parse(buf)
++			for _, proxy := range proxies {
++				defer proxy.Close()
++			}
++			if (err != nil) != tc.wantError {
++				t.Fatal("unexpected provider error policy")
++			}
++			if tc.wantError {
++				return
++			}
++			if len(proxies) != len(tc.want) {
++				t.Fatal("wrong number of retained proxies")
++			}
++			for i, name := range tc.want {
++				if proxies[i].Name() != name {
++					t.Fatal("valid proxy order changed")
++				}
++			}
++		})
++	}
++}
++
++func TestDisabledProtocolStillFailsOutsideProvider(t *testing.T) {
++	proxy, err := adapter.ParseProxy(map[string]any{"name": t.Name(), "type": "hysteria", "server": "", "up": "", "down": ""})
++	var disabled C.DisabledProtocolError
++	if proxy != nil || !errors.As(err, &disabled) {
++		t.Fatal("explicit disabled proxy configuration must remain an error")
++	}
++}

@@ -1,0 +1,177 @@
+diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
+--- a/adapter/outbound/shadowquic.go
++++ b/adapter/outbound/shadowquic.go
+@@ -1,3 +1,5 @@
++//go:build !no_shadowquic
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/shadowquic_disabled_test.go b/adapter/outbound/shadowquic_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/shadowquic_disabled_test.go
+@@ -0,0 +1,21 @@
++//go:build no_shadowquic
++
++package outbound_test
++
++import (
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/adapter/outbound"
++	"strings"
++	"testing"
++)
++
++func TestSlimShadowQuicDisabled(t *testing.T) {
++	proxy, err := outbound.NewShadowQuic(outbound.ShadowQuicOption{})
++	if proxy != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatal("disabled outbound must reject configuration before creating resources")
++	}
++	parsed, err := adapter.ParseProxy(map[string]any{"name": "disabled-test", "type": "shadowquic", "server": "", "port": 0, "password": "", "cipher": "", "obfs": "", "protocol": "", "up": "", "down": "", "ca": "", "psk": ""})
++	if parsed != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatalf("proxy parser must report a disabled protocol: %v", err)
++	}
++}
+diff --git a/adapter/outbound/shadowquic_stub.go b/adapter/outbound/shadowquic_stub.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/shadowquic_stub.go
+@@ -0,0 +1,40 @@
++//go:build no_shadowquic
++
++package outbound
++
++import (
++	"errors"
++)
++
++// Keep decoding intact; disabled protocols do not need a mystery error tour.
++type ShadowQuic struct{ *Base }
++type ShadowQuicOption struct {
++	BasicOption
++	Name                 string   `proxy:"name"`
++	Server               string   `proxy:"server"`
++	Port                 int      `proxy:"port"`
++	Username             string   `proxy:"username,omitempty"`
++	Password             string   `proxy:"password,omitempty"`
++	SNI                  string   `proxy:"sni,omitempty"`
++	ALPN                 []string `proxy:"alpn,omitempty"`
++	QUICVersions         []string `proxy:"quic-versions,omitempty"`
++	UDPOverStream        bool     `proxy:"udp-over-stream,omitempty"`
++	ZeroRTT              bool     `proxy:"zero-rtt,omitempty"`
++	KeepAliveInterval    int      `proxy:"keep-alive-interval,omitempty"`
++	CongestionController string   `proxy:"congestion-controller,omitempty"`
++	Up                   string   `proxy:"up,omitempty"`
++	Down                 string   `proxy:"down,omitempty"`
++	CWND                 int      `proxy:"cwnd,omitempty"`
++	BBRProfile           string   `proxy:"bbr-profile,omitempty"`
++	ReceiveWindowConn    int      `proxy:"recv-window-conn,omitempty"`
++	ReceiveWindow        int      `proxy:"recv-window,omitempty"`
++	DisableMTUDiscovery  bool     `proxy:"disable-mtu-discovery,omitempty"`
++	MaxDatagramFrameSize int      `proxy:"max-datagram-frame-size,omitempty"`
++	MaxOpenStreams       int      `proxy:"max-open-streams,omitempty"`
++}
++
++func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
++	return nil, errors.New("ShadowQuic support is disabled in slim builds")
++}
++
++var _ ProxyAdapter = (*ShadowQuic)(nil)
+diff --git a/listener/inbound/shadowquic.go b/listener/inbound/shadowquic.go
+--- a/listener/inbound/shadowquic.go
++++ b/listener/inbound/shadowquic.go
+@@ -1,3 +1,5 @@
++//go:build !no_shadowquic
++
+ package inbound
+ 
+ import (
+diff --git a/listener/inbound/shadowquic_disabled_test.go b/listener/inbound/shadowquic_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/listener/inbound/shadowquic_disabled_test.go
+@@ -0,0 +1,16 @@
++//go:build no_shadowquic
++
++package inbound_test
++
++import (
++	IN "github.com/metacubex/mihomo/listener/inbound"
++	"strings"
++	"testing"
++)
++
++func TestSlimShadowQuicDisabled(t *testing.T) {
++	listener, err := IN.NewShadowQuic(&IN.ShadowQuicOption{})
++	if listener != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatal("disabled inbound must reject configuration before creating resources")
++	}
++}
+diff --git a/listener/inbound/shadowquic_stub.go b/listener/inbound/shadowquic_stub.go
+new file mode 100644
+--- /dev/null
++++ b/listener/inbound/shadowquic_stub.go
+@@ -0,0 +1,53 @@
++//go:build no_shadowquic
++
++package inbound
++
++import (
++	"errors"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type ShadowQuicOption struct {
++	BaseOption
++	Users                 []ShadowQuicUser      `inbound:"users,omitempty"`
++	JLSUpstream           ShadowQuicJLSUpstream `inbound:"jls-upstream"`
++	ALPN                  []string              `inbound:"alpn,omitempty"`
++	QUICVersions          []string              `inbound:"quic-versions,omitempty"`
++	ZeroRTT               bool                  `inbound:"zero-rtt,omitempty"`
++	CongestionController  string                `inbound:"congestion-controller,omitempty"`
++	Up                    string                `inbound:"up,omitempty"`
++	Down                  string                `inbound:"down,omitempty"`
++	IgnoreClientBandwidth bool                  `inbound:"ignore-client-bandwidth,omitempty"`
++	MaxIdleTime           int                   `inbound:"max-idle-time,omitempty"`
++	MaxDatagramFrameSize  int                   `inbound:"max-datagram-frame-size,omitempty"`
++	ReceiveWindowConn     int                   `inbound:"recv-window-conn,omitempty"`
++	ReceiveWindow         int                   `inbound:"recv-window,omitempty"`
++	DisableMTUDiscovery   bool                  `inbound:"disable-mtu-discovery,omitempty"`
++	CWND                  int                   `inbound:"cwnd,omitempty"`
++	BBRProfile            string                `inbound:"bbr-profile,omitempty"`
++	MuxOption             MuxOption             `inbound:"mux-option,omitempty"`
++}
++
++type ShadowQuicUser struct {
++	Username string `inbound:"username"`
++	Password string `inbound:"password"`
++}
++
++type ShadowQuicJLSUpstream struct {
++	Addr      string `inbound:"addr"`
++	SNI       string `inbound:"sni,omitempty"`
++	Proxy     string `inbound:"proxy,omitempty"`
++	RateLimit uint64 `inbound:"rate-limit,omitempty"`
++}
++
++func (o ShadowQuicOption) Equal(config C.InboundConfig) bool {
++	return optionToString(o) == optionToString(config)
++}
++
++type ShadowQuic struct{ *Base }
++
++func NewShadowQuic(options *ShadowQuicOption) (*ShadowQuic, error) {
++	return nil, errors.New("ShadowQuic support is disabled in slim builds")
++}
++
++var _ C.InboundListener = (*ShadowQuic)(nil)
+diff --git a/listener/inbound/shadowquic_test.go b/listener/inbound/shadowquic_test.go
+--- a/listener/inbound/shadowquic_test.go
++++ b/listener/inbound/shadowquic_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_shadowquic
++
+ package inbound_test
+ 
+ import (

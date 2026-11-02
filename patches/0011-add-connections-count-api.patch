@@ -1,0 +1,396 @@
+diff --git a/hub/route/connections.go b/hub/route/connections.go
+--- a/hub/route/connections.go
++++ b/hub/route/connections.go
+@@ -16,6 +16,7 @@
+ func connectionRouter() http.Handler {
+ 	r := chi.NewRouter()
+ 	r.Get("/", getConnections)
++	r.Get("/count", getConnectionCount)
+ 	r.Delete("/", closeAllConnections)
+ 	r.Delete("/{id}", closeConnection)
+ 	return r
+diff --git a/hub/route/connections_count.go b/hub/route/connections_count.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/connections_count.go
+@@ -0,0 +1,73 @@
++package route
++
++import (
++	"bytes"
++	"encoding/json"
++	"strconv"
++	"time"
++
++	"github.com/metacubex/mihomo/tunnel/statistic"
++
++	"github.com/metacubex/chi/render"
++	"github.com/metacubex/http"
++)
++
++type connectionCount struct {
++	Count int `json:"count"`
++}
++
++func getConnectionCount(w http.ResponseWriter, r *http.Request) {
++	count := func() connectionCount {
++		return connectionCount{Count: statistic.DefaultManager.ConnectionCount()}
++	}
++	if r.Header.Get("Upgrade") != "websocket" {
++		render.JSON(w, r, count())
++		return
++	}
++
++	interval := 1000
++	if value := r.URL.Query().Get("interval"); value != "" {
++		var err error
++		interval, err = strconv.Atoi(value)
++		if err != nil || interval < 100 || interval > 60000 {
++			render.Status(r, http.StatusBadRequest)
++			render.JSON(w, r, ErrBadRequest)
++			return
++		}
++	}
++
++	conn, _, err := wsUpgrade(r, w)
++	if conn != nil {
++		defer conn.Close()
++	}
++	if err != nil {
++		return
++	}
++	var buf bytes.Buffer
++	encoder := json.NewEncoder(&buf)
++	send := func() error {
++		buf.Reset()
++		if err := encoder.Encode(count()); err != nil {
++			return err
++		}
++		if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
++			return err
++		}
++		return wsWriteServerText(conn, buf.Bytes())
++	}
++	if send() != nil {
++		return
++	}
++	tick := time.NewTicker(time.Duration(interval) * time.Millisecond)
++	defer tick.Stop()
++	for {
++		select {
++		case <-r.Context().Done():
++			return
++		case <-tick.C:
++			if send() != nil {
++				return
++			}
++		}
++	}
++}
+diff --git a/hub/route/connections_count_test.go b/hub/route/connections_count_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/connections_count_test.go
+@@ -0,0 +1,206 @@
++package route
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/tunnel/statistic"
++
++	"github.com/gobwas/ws"
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++)
++
++type routeCountTracker struct {
++	statistic.Tracker
++	id string
++}
++
++func (c routeCountTracker) ID() string { return c.id }
++func (c routeCountTracker) Info() *statistic.TrackerInfo {
++	panic("count endpoint must not inspect tracker metadata")
++}
++
++func countTestManager(t *testing.T) *statistic.Manager {
++	t.Helper()
++	previous := statistic.DefaultManager
++	manager := &statistic.Manager{}
++	statistic.DefaultManager = manager
++	t.Cleanup(func() { statistic.DefaultManager = previous })
++	return manager
++}
++
++func checkCountJSON(t *testing.T, data []byte, want int) {
++	t.Helper()
++	var value map[string]int
++	if err := json.Unmarshal(data, &value); err != nil || len(value) != 1 || value["count"] != want {
++		t.Fatal("unexpected count JSON response")
++	}
++	if _, ok := value["count"]; !ok {
++		t.Fatal("response is missing count")
++	}
++}
++
++func TestConnectionCountHTTP(t *testing.T) {
++	manager := countTestManager(t)
++	handler := router(false, t.Name(), "", Cors{})
++	tracker := routeCountTracker{id: "count-test"}
++	for _, want := range []int{0, 1, 0} {
++		if want == 1 {
++			manager.Join(tracker)
++		} else {
++			manager.Leave(tracker)
++		}
++		request := httptest.NewRequest(http.MethodGet, "/connections/count", nil)
++		request.Header.Set("Authorization", "Bearer "+t.Name())
++		recorder := httptest.NewRecorder()
++		handler.ServeHTTP(recorder, request)
++		if recorder.Code != http.StatusOK {
++			t.Fatal("authenticated count request failed")
++		}
++		checkCountJSON(t, recorder.Body.Bytes(), want)
++	}
++	for _, upgrade := range []string{"", "websocket"} {
++		request := httptest.NewRequest(http.MethodGet, "/connections/count", nil)
++		request.Header.Set("Upgrade", upgrade)
++		recorder := httptest.NewRecorder()
++		handler.ServeHTTP(recorder, request)
++		if recorder.Code != http.StatusUnauthorized {
++			t.Fatal("count route bypassed authentication")
++		}
++	}
++	for _, tc := range []struct {
++		method string
++		path   string
++		status int
++	}{
++		{http.MethodGet, "/connections", http.StatusOK},
++		{http.MethodDelete, "/connections/count", http.StatusNoContent},
++		{http.MethodDelete, "/connections/unused", http.StatusNoContent},
++		{http.MethodDelete, "/connections", http.StatusNoContent},
++	} {
++		request := httptest.NewRequest(tc.method, tc.path, nil)
++		request.Header.Set("Authorization", "Bearer "+t.Name())
++		recorder := httptest.NewRecorder()
++		handler.ServeHTTP(recorder, request)
++		if recorder.Code != tc.status {
++			t.Fatal("existing connections route changed")
++		}
++	}
++}
++
++func TestConnectionCountInvalidInterval(t *testing.T) {
++	for _, interval := range []string{"invalid", "0", "-1", "99", "60001", "9223372036854775807"} {
++		t.Run(interval, func(t *testing.T) {
++			request := httptest.NewRequest(http.MethodGet, "/count?interval="+interval, nil)
++			request.Header.Set("Upgrade", "websocket")
++			recorder := httptest.NewRecorder()
++			connectionRouter().ServeHTTP(recorder, request)
++			if recorder.Code != http.StatusBadRequest {
++				t.Fatal("invalid interval must fail before hijacking")
++			}
++		})
++	}
++}
++
++type countHijacker struct {
++	*httptest.ResponseRecorder
++	conn net.Conn
++}
++
++func (w countHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
++}
++
++func openCountWebSocket(t *testing.T, path string) (net.Conn, *bufio.Reader, <-chan struct{}, context.CancelFunc) {
++	t.Helper()
++	server, client := net.Pipe()
++	ctx, cancel := context.WithCancel(context.Background())
++	request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
++	request.Host = t.Name()
++	request.Header.Set("Upgrade", "websocket")
++	request.Header.Set("Connection", "Upgrade")
++	request.Header.Set("Sec-WebSocket-Version", "13")
++	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
++	done := make(chan struct{})
++	handler := router(false, t.Name(), "", Cors{})
++	go func() {
++		defer close(done)
++		defer server.Close()
++		handler.ServeHTTP(countHijacker{httptest.NewRecorder(), server}, request)
++	}()
++	t.Cleanup(func() {
++		cancel()
++		client.Close()
++		select {
++		case <-done:
++		case <-time.After(2 * time.Second):
++			t.Error("count WebSocket handler did not stop")
++		}
++	})
++	client.SetDeadline(time.Now().Add(2 * time.Second))
++	reader := bufio.NewReader(client)
++	response, err := http.ReadResponse(reader, request)
++	if err != nil || response.StatusCode != http.StatusSwitchingProtocols {
++		t.Fatal("count WebSocket handshake failed")
++	}
++	return client, reader, done, cancel
++}
++
++func readCountFrame(t *testing.T, reader *bufio.Reader) (ws.OpCode, []byte) {
++	t.Helper()
++	header, err := ws.ReadHeader(reader)
++	if err != nil || ws.CheckHeader(header, ws.StateClientSide) != nil || !header.Fin || header.Length < 0 || header.Length > 125 {
++		t.Fatal("invalid count WebSocket frame")
++	}
++	data := make([]byte, int(header.Length))
++	if _, err := io.ReadFull(reader, data); err != nil {
++		t.Fatal("incomplete count WebSocket frame")
++	}
++	return header.OpCode, data
++}
++
++func TestConnectionCountWebSocket(t *testing.T) {
++	manager := countTestManager(t)
++	_, reader, _, _ := openCountWebSocket(t, "/connections/count?interval=100&token="+t.Name())
++	op, data := readCountFrame(t, reader)
++	if op != ws.OpText {
++		t.Fatal("count must use text frames")
++	}
++	checkCountJSON(t, data, 0)
++	manager.Join(routeCountTracker{id: "ws-count"})
++	_, data = readCountFrame(t, reader)
++	checkCountJSON(t, data, 1)
++}
++
++func TestConnectionCountWebSocketStops(t *testing.T) {
++	for _, mode := range []string{"disconnect", "cancel", "immediate", "default-interval"} {
++		t.Run(mode, func(t *testing.T) {
++			countTestManager(t)
++			path := "/connections/count?interval=100&token=" + t.Name()
++			if mode == "immediate" {
++				path = "/connections/count?interval=60000&token=" + t.Name()
++			} else if mode == "default-interval" {
++				path = "/connections/count?token=" + t.Name()
++			}
++			client, reader, done, cancel := openCountWebSocket(t, path)
++			_, data := readCountFrame(t, reader)
++			checkCountJSON(t, data, 0)
++			if mode == "cancel" || mode == "immediate" {
++				cancel()
++			} else {
++				client.Close()
++			}
++			select {
++			case <-done:
++			case <-time.After(2 * time.Second):
++				t.Fatal("count handler did not stop")
++			}
++		})
++	}
++}
+diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
+--- a/tunnel/statistic/manager.go
++++ b/tunnel/statistic/manager.go
+@@ -56,6 +56,10 @@
+ 	m.connections.Range(func(key string, value Tracker) bool {
+ 		return f(value)
+ 	})
++}
++
++func (m *Manager) ConnectionCount() int {
++	return m.connections.Size()
+ }
+ 
+ func (m *Manager) PushUploaded(size int64) {
+diff --git a/tunnel/statistic/manager_count_test.go b/tunnel/statistic/manager_count_test.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/statistic/manager_count_test.go
+@@ -0,0 +1,77 @@
++package statistic
++
++import (
++	"strconv"
++	"sync"
++	"testing"
++)
++
++type countOnlyTracker struct {
++	Tracker
++	id string
++}
++
++func (c countOnlyTracker) ID() string { return c.id }
++
++func TestConnectionCountLifecycle(t *testing.T) {
++	var manager Manager
++	a, b := countOnlyTracker{id: "a"}, countOnlyTracker{id: "b"}
++	check := func(want int) {
++		t.Helper()
++		if got := manager.ConnectionCount(); got != want {
++			t.Fatalf("count = %d, want %d", got, want)
++		}
++	}
++	check(0)
++	manager.Join(a)
++	manager.Join(a)
++	manager.Join(b)
++	check(2)
++	manager.Leave(a)
++	manager.Leave(a)
++	check(1)
++	manager.ResetStatistic()
++	check(1)
++	manager.Leave(b)
++	check(0)
++}
++
++func TestConnectionCountConcurrent(t *testing.T) {
++	var manager Manager
++	var workers sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		workers.Add(1)
++		go func(id int) {
++			defer workers.Done()
++			tracker := countOnlyTracker{id: strconv.Itoa(id)}
++			for j := 0; j < 1000; j++ {
++				manager.Join(tracker)
++				if manager.ConnectionCount() < 0 {
++					t.Error("connection count became negative")
++				}
++				manager.Leave(tracker)
++			}
++		}(i)
++	}
++	workers.Wait()
++	if manager.ConnectionCount() != 0 {
++		t.Fatal("closed connections remain counted")
++	}
++}
++
++func BenchmarkConnectionCount(b *testing.B) {
++	for _, size := range []int{0, 10000} {
++		b.Run(strconv.Itoa(size), func(b *testing.B) {
++			var manager Manager
++			for i := 0; i < size; i++ {
++				manager.Join(countOnlyTracker{id: strconv.Itoa(i)})
++			}
++			manager.ConnectionCount()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				manager.ConnectionCount()
++			}
++		})
++	}
++}

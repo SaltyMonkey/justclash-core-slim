@@ -1,0 +1,90 @@
+diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
+--- a/adapter/outbound/openvpn.go
++++ b/adapter/outbound/openvpn.go
+@@ -1,3 +1,5 @@
++//go:build !no_openvpn
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/openvpn_disabled_test.go b/adapter/outbound/openvpn_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/openvpn_disabled_test.go
+@@ -0,0 +1,21 @@
++//go:build no_openvpn
++
++package outbound_test
++
++import (
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/adapter/outbound"
++	"strings"
++	"testing"
++)
++
++func TestSlimOpenVPNDisabled(t *testing.T) {
++	proxy, err := outbound.NewOpenVPN(outbound.OpenVPNOption{})
++	if proxy != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatal("disabled outbound must reject configuration before creating resources")
++	}
++	parsed, err := adapter.ParseProxy(map[string]any{"name": "disabled-test", "type": "openvpn", "server": "", "port": 0, "password": "", "cipher": "", "obfs": "", "protocol": "", "up": "", "down": "", "ca": "", "psk": ""})
++	if parsed != nil || err == nil || !strings.Contains(err.Error(), "disabled in slim builds") {
++		t.Fatalf("proxy parser must report a disabled protocol: %v", err)
++	}
++}
+diff --git a/adapter/outbound/openvpn_stub.go b/adapter/outbound/openvpn_stub.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/openvpn_stub.go
+@@ -0,0 +1,50 @@
++//go:build no_openvpn
++
++package outbound
++
++import (
++	"errors"
++)
++
++// Keep decoding intact; disabled protocols do not need a mystery error tour.
++type OpenVPN struct{ *Base }
++type OpenVPNOption struct {
++	BasicOption
++	Name               string            `proxy:"name"`
++	Server             string            `proxy:"server"`
++	Port               int               `proxy:"port"`
++	Proto              string            `proxy:"proto,omitempty"`
++	Dev                string            `proxy:"dev,omitempty"`
++	Cipher             string            `proxy:"cipher,omitempty"`
++	DataCiphers        []string          `proxy:"data-ciphers,omitempty"`
++	DataCipherFallback string            `proxy:"data-ciphers-fallback,omitempty"`
++	Auth               string            `proxy:"auth,omitempty"`
++	CompLZO            string            `proxy:"comp-lzo,omitempty"`
++	CA                 string            `proxy:"ca"`
++	Cert               string            `proxy:"cert,omitempty"`
++	Key                string            `proxy:"key,omitempty"`
++	TLSAuth            string            `proxy:"tls-auth,omitempty"`
++	KeyDirection       string            `proxy:"key-direction,omitempty"`
++	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
++	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
++	Username           string            `proxy:"username,omitempty"`
++	Password           string            `proxy:"password,omitempty"`
++	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
++	Ping               int               `proxy:"ping,omitempty"`
++	PingRestart        int               `proxy:"ping-restart,omitempty"`
++	TranWindow         *int              `proxy:"tran-window,omitempty"`
++	HandshakeTimeout   int               `proxy:"handshake-timeout,omitempty"`
++	MTU                int               `proxy:"mtu,omitempty"`
++	UDP                bool              `proxy:"udp,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++}
++
++func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
++	return nil, errors.New("OpenVPN support is disabled in slim builds")
++}
++
++var _ ProxyAdapter = (*OpenVPN)(nil)

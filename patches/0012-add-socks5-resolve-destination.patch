@@ -1,0 +1,531 @@
+diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
+--- a/adapter/outbound/socks5.go
++++ b/adapter/outbound/socks5.go
+@@ -41,10 +41,21 @@
+ 	Fingerprint    string `proxy:"fingerprint,omitempty"`
+ 	Certificate    string `proxy:"certificate,omitempty"`
+ 	PrivateKey     string `proxy:"private-key,omitempty"`
++
++	ResolveDestination bool `proxy:"resolve-destination,omitempty"`
+ }
+ 
+ // StreamConnContext implements C.ProxyAdapter
+ func (ss *Socks5) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (net.Conn, error) {
++	if ss.option.ResolveDestination {
++		local := *metadata
++		if err := ss.Base.ResolveUDP(ctx, &local); err != nil {
++			return nil, err
++		}
++		local.Host = "" // SOCKS prefers Host over DstIP; resolving alone is only half the job.
++		metadata = &local
++	}
++
+ 	if ss.tls {
+ 		cc := tls.Client(c, ss.tlsConfig)
+ 		err := cc.HandshakeContext(ctx)
+@@ -160,6 +171,11 @@
+ 	info := ss.Base.ProxyInfo()
+ 	info.DialerProxy = ss.option.DialerProxy
+ 	return info
++}
++
++func (ss *Socks5) IsL3Protocol(metadata *C.Metadata) bool {
++	// DNSDialer must use its bootstrap resolver before entering a local-resolving proxy.
++	return ss.option.ResolveDestination
+ }
+ 
+ func (ss *Socks5) clientHandshakeContext(ctx context.Context, c net.Conn, addr socks5.Addr, command socks5.Command, user *socks5.User) (_ socks5.Addr, err error) {
+diff --git a/adapter/outbound/socks5_resolve_destination_test.go b/adapter/outbound/socks5_resolve_destination_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/socks5_resolve_destination_test.go
+@@ -0,0 +1,489 @@
++package outbound_test
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/adapter/outbound"
++	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/component/trie"
++	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/mihomo/transport/socks5"
++	"github.com/metacubex/mihomo/tunnel"
++)
++
++type socksLocalResolver struct {
++	resolver.Resolver
++	lookup func(context.Context, string, string) ([]netip.Addr, error)
++}
++
++func (s socksLocalResolver) Invalid() bool { return true }
++func (s socksLocalResolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
++	return s.lookup(ctx, host, "ip")
++}
++func (s socksLocalResolver) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
++	return s.lookup(ctx, host, "ipv4")
++}
++func (s socksLocalResolver) LookupIPv6(ctx context.Context, host string) ([]netip.Addr, error) {
++	return s.lookup(ctx, host, "ipv6")
++}
++
++func setupSocksLocalDNS(t *testing.T, lookup func(context.Context, string, string) ([]netip.Addr, error)) {
++	t.Helper()
++	previous, previousHosts := resolver.DefaultResolver, resolver.DefaultHosts
++	previousIPv6, previousSystemHosts := resolver.DisableIPv6, resolver.UseSystemHosts
++	resolver.DefaultResolver = socksLocalResolver{lookup: lookup}
++	resolver.DefaultHosts = resolver.NewHosts(trie.New[resolver.HostValue]())
++	resolver.DisableIPv6, resolver.UseSystemHosts = false, false
++	t.Cleanup(func() {
++		resolver.DefaultResolver, resolver.DefaultHosts = previous, previousHosts
++		resolver.DisableIPv6, resolver.UseSystemHosts = previousIPv6, previousSystemHosts
++	})
++}
++
++// The peer only records the SOCKS request; no DNS server or network port is needed.
++func socksLocalPeer(t *testing.T, payload ...[]byte) (net.Conn, <-chan socks5.Addr) {
++	t.Helper()
++	return socksLocalChainPeer(t, 1, payload...)
++}
++
++func socksLocalChainPeer(t *testing.T, hops int, payload ...[]byte) (net.Conn, <-chan socks5.Addr) {
++	t.Helper()
++	client, server := net.Pipe()
++	client.SetDeadline(time.Now().Add(3 * time.Second))
++	server.SetDeadline(time.Now().Add(3 * time.Second))
++	result := make(chan socks5.Addr, hops)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		defer server.Close()
++		defer close(result)
++		for hop := 0; hop < hops; hop++ {
++			var header [3]byte
++			if _, err := io.ReadFull(server, header[:]); err != nil || !bytes.Equal(header[:], []byte{5, 1, 0}) {
++				return
++			}
++			if _, err := server.Write([]byte{5, 0}); err != nil {
++				return
++			}
++			if _, err := io.ReadFull(server, header[:]); err != nil || header[1] != socks5.CmdConnect {
++				return
++			}
++			addr, err := socks5.ReadAddr0(server)
++			if err != nil {
++				return
++			}
++			if _, err := server.Write([]byte{5, 0, 0, socks5.AtypIPv4, 0, 0, 0, 0, 0, 0}); err != nil {
++				return
++			}
++			result <- addr
++		}
++		if len(payload) > 0 {
++			data := make([]byte, len(payload[0]))
++			if _, err := io.ReadFull(server, data); err != nil || !bytes.Equal(data, payload[0]) {
++				t.Error("SOCKS changed the forwarded application bytes")
++				return
++			}
++			server.Write([]byte{1})
++		}
++	}()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++		select {
++		case <-done:
++		case <-time.After(3 * time.Second):
++			t.Error("SOCKS test peer did not stop")
++		}
++	})
++	return client, result
++}
++
++func TestSocks5ResolveDestinationWireAddress(t *testing.T) {
++	v4 := netip.AddrFrom4([4]byte{192, 0, 2, 1})
++	v6 := netip.AddrFrom16([16]byte{0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
++	for _, tc := range []struct {
++		name    string
++		local   bool
++		prefer  C.DNSPrefer
++		dst     netip.Addr
++		mode    C.DNSMode
++		wantIP  netip.Addr
++		family  string
++		literal bool
++		dnsOff  bool
++	}{
++		{name: "default-domain"},
++		{name: "default-with-known-ip", dst: v4},
++		{name: "ipv4", local: true, prefer: C.IPv4Only, wantIP: v4, family: "ipv4"},
++		{name: "ipv6", local: true, prefer: C.IPv6Only, wantIP: v6, family: "ipv6"},
++		{name: "prefer-ipv6", local: true, prefer: C.IPv6Prefer, wantIP: v6, family: "ip"},
++		{name: "prefer-ipv4", local: true, prefer: C.IPv4Prefer, wantIP: v4, family: "ip"},
++		{name: "reuse-resolved", local: true, dst: v4, wantIP: v4},
++		{name: "fake-ip-domain", local: true, mode: C.DNSFakeIP, wantIP: v4, family: "ip"},
++		{name: "literal-ipv4", local: true, literal: true, dst: v4, wantIP: v4},
++		{name: "literal-ipv6", local: true, literal: true, dst: v6, wantIP: v6},
++		{name: "dns-disabled-fallback", local: true, dnsOff: true, wantIP: v4, family: "ip"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			setupSocksLocalDNS(t, func(ctx context.Context, host, family string) ([]netip.Addr, error) {
++				calls++
++				if host != "target.invalid" || family != tc.family {
++					t.Error("unexpected target or address-family lookup")
++				}
++				switch family {
++				case "ipv4":
++					return []netip.Addr{v4}, nil
++				case "ipv6":
++					return []netip.Addr{v6}, nil
++				default:
++					return []netip.Addr{v4, v6}, nil
++				}
++			})
++			if tc.dnsOff {
++				previousSystem := resolver.SystemResolver
++				resolver.SystemResolver, resolver.DefaultResolver = resolver.DefaultResolver, nil
++				t.Cleanup(func() { resolver.SystemResolver = previousSystem })
++			}
++			proxy, err := outbound.NewSocks5(outbound.Socks5Option{
++				BasicOption: outbound.BasicOption{IPVersion: tc.prefer}, ResolveDestination: tc.local,
++			})
++			if err != nil {
++				t.Fatal("SOCKS construction failed")
++			}
++			metadata := &C.Metadata{Host: "target.invalid", DstIP: tc.dst, DstPort: 443, NetWork: C.TCP, DNSMode: tc.mode}
++			if tc.literal {
++				metadata.Host = ""
++			}
++			before := *metadata
++			client, received := socksLocalPeer(t)
++			conn, err := proxy.StreamConnContext(context.Background(), client, metadata)
++			if err != nil {
++				t.Fatal("SOCKS handshake failed")
++			}
++			conn.Close()
++			want := socks5.ParseAddr("target.invalid:443")
++			if tc.wantIP.IsValid() {
++				want = socks5.AddrFromStdAddrPort(netip.AddrPortFrom(tc.wantIP, 443))
++			}
++			if got := <-received; !bytes.Equal(got, want) {
++				t.Fatal("SOCKS destination address differs from expected encoding")
++			}
++			if !reflect.DeepEqual(*metadata, before) {
++				t.Fatal("shared metadata was mutated")
++			}
++			wantCalls := 0
++			if tc.family != "" {
++				wantCalls = 1
++			}
++			if calls != wantCalls || proxy.IsL3Protocol(metadata) != tc.local {
++				t.Fatal("unexpected resolver calls or DNSDialer policy")
++			}
++		})
++	}
++}
++
++func TestSocks5ResolveDestinationFailure(t *testing.T) {
++	for _, mode := range []string{"dns-error", "canceled", "empty-answer"} {
++		t.Run(mode, func(t *testing.T) {
++			sentinel := errors.New("test resolution failure")
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			if mode == "canceled" {
++				cancel()
++				sentinel = context.Canceled
++			} else if mode == "empty-answer" {
++				sentinel = resolver.ErrIPNotFound
++			}
++			setupSocksLocalDNS(t, func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
++				if mode == "canceled" {
++					return nil, ctx.Err()
++				} else if mode == "empty-answer" {
++					return nil, nil
++				}
++				return nil, sentinel
++			})
++			proxy, _ := outbound.NewSocks5(outbound.Socks5Option{ResolveDestination: true})
++			metadata := &C.Metadata{Host: "target.invalid", DstPort: 443}
++			before := *metadata
++			// A DNS failure must return before touching the connection or sending a domain remotely.
++			conn, err := proxy.StreamConnContext(ctx, nil, metadata)
++			if conn != nil || !errors.Is(err, sentinel) || !reflect.DeepEqual(*metadata, before) {
++				t.Fatal("DNS error or cancellation was lost")
++			}
++			client, peer := net.Pipe()
++			defer client.Close()
++			defer peer.Close()
++			proxy, _ = outbound.NewSocks5(outbound.Socks5Option{
++				BasicOption: outbound.BasicOption{DialerForAPI: socksLocalDialer{conn: client}}, ResolveDestination: true,
++			})
++			if conn, err := proxy.DialContext(ctx, metadata); conn != nil || !errors.Is(err, sentinel) {
++				t.Fatal("DialContext lost the destination resolution error")
++			}
++			peer.SetReadDeadline(time.Now().Add(3 * time.Second))
++			var data [1]byte
++			if _, err := peer.Read(data[:]); err != io.EOF {
++				t.Fatal("failed SOCKS connection was not closed before sending handshake bytes")
++			}
++		})
++	}
++}
++
++func TestSocks5ResolveDestinationHostsAndUDP(t *testing.T) {
++	v4 := netip.AddrFrom4([4]byte{192, 0, 2, 1})
++	setupSocksLocalDNS(t, func(context.Context, string, string) ([]netip.Addr, error) {
++		t.Fatal("hosts match must bypass DNS lookup")
++		return nil, nil
++	})
++	value, _ := resolver.NewHostValueByIPs([]netip.Addr{v4})
++	if err := resolver.DefaultHosts.Insert("target.invalid", value); err != nil {
++		t.Fatal("hosts fixture failed")
++	}
++	for _, local := range []bool{false, true} {
++		proxy, _ := outbound.NewSocks5(outbound.Socks5Option{ResolveDestination: local})
++		metadata := &C.Metadata{Host: "target.invalid", DstPort: 443, NetWork: C.UDP}
++		if err := proxy.ResolveUDP(context.Background(), metadata); err != nil || metadata.DstIP != v4 {
++			t.Fatal("existing local UDP resolution changed")
++		}
++	}
++	proxy, _ := outbound.NewSocks5(outbound.Socks5Option{ResolveDestination: true})
++	client, received := socksLocalPeer(t)
++	conn, err := proxy.StreamConnContext(context.Background(), client, &C.Metadata{Host: "target.invalid", DstPort: 443})
++	if err != nil {
++		t.Fatal("hosts-based TCP resolution failed")
++	}
++	conn.Close()
++	if !bytes.Equal(<-received, socks5.AddrFromStdAddrPort(netip.AddrPortFrom(v4, 443))) {
++		t.Fatal("hosts address was not sent to SOCKS")
++	}
++}
++
++type socksLocalDialer struct {
++	C.Dialer
++	conn net.Conn
++}
++
++func (d socksLocalDialer) DialContext(context.Context, string, string) (net.Conn, error) {
++	return d.conn, nil
++}
++
++func TestSocks5ResolveDestinationDNSBootstrap(t *testing.T) {
++	setupSocksLocalDNS(t, func(context.Context, string, string) ([]netip.Addr, error) {
++		t.Fatal("DNS transport recursed into the default resolver")
++		return nil, nil
++	})
++	v4 := netip.AddrFrom4([4]byte{192, 0, 2, 1})
++	bootstrapCalls := 0
++	bootstrap := socksLocalResolver{lookup: func(context.Context, string, string) ([]netip.Addr, error) {
++		bootstrapCalls++
++		return []netip.Addr{v4}, nil
++	}}
++	client, received := socksLocalPeer(t)
++	proxy, err := outbound.NewSocks5(outbound.Socks5Option{
++		BasicOption: outbound.BasicOption{DialerForAPI: socksLocalDialer{conn: client}}, ResolveDestination: true,
++	})
++	if err != nil {
++		t.Fatal("SOCKS construction failed")
++	}
++	conn, err := tunnel.NewDNSDialer(bootstrap, proxy, "").DialContext(context.Background(), "tcp", "resolver.invalid:443")
++	if err != nil {
++		t.Fatal("DNS bootstrap through SOCKS failed")
++	}
++	conn.Close()
++	if bootstrapCalls != 1 || !bytes.Equal(<-received, socks5.AddrFromStdAddrPort(netip.AddrPortFrom(v4, 443))) {
++		t.Fatal("DNSDialer did not resolve through the supplied bootstrap resolver")
++	}
++}
++
++func TestSocks5ResolveDestinationConfig(t *testing.T) {
++	proxy, err := adapter.ParseProxy(map[string]any{
++		"name": "test-socks", "type": "socks5", "server": "proxy.invalid", "port": 1080, "resolve-destination": true,
++	})
++	if err != nil || !proxy.IsL3Protocol(&C.Metadata{}) {
++		t.Fatal("SOCKS resolve-destination configuration was not decoded")
++	}
++}
++
++type socksLocalTunnel struct {
++	C.Tunnel
++	proxies map[string]C.Proxy
++}
++
++func (s socksLocalTunnel) Proxies() map[string]C.Proxy { return s.proxies }
++
++func TestSocks5ResolveDestinationDialerProxy(t *testing.T) {
++	entryIP := netip.AddrFrom4([4]byte{192, 0, 2, 10})
++	exitIP := netip.AddrFrom4([4]byte{192, 0, 2, 20})
++	targetIP := netip.AddrFrom4([4]byte{192, 0, 2, 30})
++	for _, entryLocal := range []bool{false, true} {
++		for _, exitLocal := range []bool{false, true} {
++			name := "entry-remote"
++			if entryLocal {
++				name = "entry-core"
++			}
++			if exitLocal {
++				name += "/exit-core"
++			} else {
++				name += "/exit-remote"
++			}
++			t.Run(name, func(t *testing.T) {
++				calls := make(map[string]int)
++				setupSocksLocalDNS(t, func(ctx context.Context, host, family string) ([]netip.Addr, error) {
++					calls[host]++
++					switch host {
++					case "exit.invalid":
++						return []netip.Addr{exitIP}, nil
++					case "target.invalid":
++						return []netip.Addr{targetIP}, nil
++					default:
++						return nil, errors.New("unexpected destination lookup")
++					}
++				})
++				previous := resolver.ProxyServerHostResolver
++				resolver.ProxyServerHostResolver = socksLocalResolver{lookup: func(ctx context.Context, host, family string) ([]netip.Addr, error) {
++					calls[host]++
++					if host != "entry.invalid" {
++						return nil, errors.New("unexpected proxy-server lookup")
++					}
++					return []netip.Addr{entryIP}, nil
++				}}
++				t.Cleanup(func() { resolver.ProxyServerHostResolver = previous })
++				client, received := socksLocalChainPeer(t, 2, []byte{7})
++				coreDialer := dialer.NewDialer(dialer.WithNetDialer(dialer.NetDialerFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
++					addr, err := netip.ParseAddrPort(address)
++					if err != nil || addr.Addr() != entryIP || addr.Port() != 1080 {
++						t.Error("wrong dialer-proxy entry address")
++					}
++					return client, nil
++				})))
++				entry, err := outbound.NewSocks5(outbound.Socks5Option{
++					BasicOption: outbound.BasicOption{DialerForAPI: coreDialer},
++					Name:        "entry", Server: "entry.invalid", Port: 1080, ResolveDestination: entryLocal,
++				})
++				if err != nil {
++					t.Fatal("entry SOCKS construction failed")
++				}
++				route := socksLocalTunnel{proxies: map[string]C.Proxy{"entry": adapter.NewProxy(entry)}}
++				exit, err := outbound.NewSocks5(outbound.Socks5Option{
++					BasicOption: outbound.BasicOption{DialerProxy: "entry", TunnelForAPI: route},
++					Name:        "exit", Server: "exit.invalid", Port: 2080, ResolveDestination: exitLocal,
++				})
++				if err != nil {
++					t.Fatal("exit SOCKS construction failed")
++				}
++				metadata := &C.Metadata{Host: "target.invalid", DstPort: 443, NetWork: C.TCP}
++				before := *metadata
++				conn, err := exit.DialContext(context.Background(), metadata)
++				if err != nil {
++					t.Fatal("SOCKS dialer-proxy chain failed")
++				}
++				defer conn.Close()
++				if _, err := conn.Write([]byte{7}); err != nil {
++					t.Fatal("chained payload write failed")
++				}
++				var ack [1]byte
++				if _, err := io.ReadFull(conn, ack[:]); err != nil || ack[0] != 1 {
++					t.Fatal("chained payload was not forwarded")
++				}
++				wantEntry, wantExit := socks5.ParseAddr("exit.invalid:2080"), socks5.ParseAddr("target.invalid:443")
++				wantCalls := map[string]int{"entry.invalid": 1}
++				if entryLocal {
++					wantEntry = socks5.AddrFromStdAddrPort(netip.AddrPortFrom(exitIP, 2080))
++					wantCalls["exit.invalid"] = 1
++				}
++				if exitLocal {
++					wantExit = socks5.AddrFromStdAddrPort(netip.AddrPortFrom(targetIP, 443))
++					wantCalls["target.invalid"] = 1
++				}
++				if !bytes.Equal(<-received, wantEntry) || !bytes.Equal(<-received, wantExit) || !reflect.DeepEqual(calls, wantCalls) || !reflect.DeepEqual(*metadata, before) {
++					t.Fatal("dialer-proxy changed hop resolution, request addresses, or shared metadata")
++				}
++			})
++		}
++	}
++}
++
++func TestSocks5ResolveDestinationDNSSeparationAndPayload(t *testing.T) {
++	proxyIP := netip.AddrFrom4([4]byte{192, 0, 2, 10})
++	targetIP := netip.AddrFrom4([4]byte{192, 0, 2, 20})
++	for _, enabled := range []bool{false, true} {
++		name := "remote"
++		if enabled {
++			name = "core"
++		}
++		t.Run(name, func(t *testing.T) {
++			targetCalls, proxyCalls := 0, 0
++			setupSocksLocalDNS(t, func(ctx context.Context, host, family string) ([]netip.Addr, error) {
++				targetCalls++
++				if host != "target.invalid" {
++					t.Error("main resolver received the proxy server hostname")
++				}
++				return []netip.Addr{targetIP}, nil
++			})
++			previousProxy, previousDirect := resolver.ProxyServerHostResolver, resolver.DirectHostResolver
++			resolver.ProxyServerHostResolver = socksLocalResolver{lookup: func(ctx context.Context, host, family string) ([]netip.Addr, error) {
++				proxyCalls++
++				if host != "proxy.invalid" {
++					t.Error("proxy resolver received the destination hostname")
++				}
++				return []netip.Addr{proxyIP}, nil
++			}}
++			resolver.DirectHostResolver = socksLocalResolver{lookup: func(context.Context, string, string) ([]netip.Addr, error) {
++				t.Error("SOCKS unexpectedly used the DIRECT resolver")
++				return nil, errors.New("unexpected DIRECT lookup")
++			}}
++			t.Cleanup(func() {
++				resolver.ProxyServerHostResolver, resolver.DirectHostResolver = previousProxy, previousDirect
++			})
++			payload := []byte("GET / HTTP/1.1\r\nHost: target.invalid\r\n\r\n\x00\xff")
++			client, received := socksLocalPeer(t, payload)
++			coreDialer := dialer.NewDialer(dialer.WithNetDialer(dialer.NetDialerFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
++				addr, err := netip.ParseAddrPort(address)
++				if err != nil || addr.Addr() != proxyIP || addr.Port() != 1080 {
++					t.Error("SOCKS server was not resolved using the proxy-server resolver")
++				}
++				return client, nil
++			})))
++			proxy, err := outbound.NewSocks5(outbound.Socks5Option{
++				BasicOption: outbound.BasicOption{DialerForAPI: coreDialer},
++				Name:        "socks-test", Server: "proxy.invalid", Port: 1080, ResolveDestination: enabled,
++			})
++			if err != nil {
++				t.Fatal("SOCKS construction failed")
++			}
++			metadata := &C.Metadata{Host: "target.invalid", DstPort: 443, NetWork: C.TCP}
++			before := *metadata
++			conn, err := proxy.DialContext(context.Background(), metadata)
++			if err != nil {
++				t.Fatal("SOCKS connection failed")
++			}
++			defer conn.Close()
++			if _, err := conn.Write(payload); err != nil {
++				t.Fatal("application payload write failed")
++			}
++			var ack [1]byte
++			if _, err := io.ReadFull(conn, ack[:]); err != nil || ack[0] != 1 {
++				t.Fatal("application payload was not forwarded intact")
++			}
++			want := socks5.ParseAddr("target.invalid:443")
++			wantTargetCalls := 0
++			if enabled {
++				want = socks5.AddrFromStdAddrPort(netip.AddrPortFrom(targetIP, 443))
++				wantTargetCalls = 1
++			}
++			if !bytes.Equal(<-received, want) || targetCalls != wantTargetCalls || proxyCalls != 1 || !reflect.DeepEqual(*metadata, before) {
++				t.Fatal("DNS policy, wire address, or shared metadata changed")
++			}
++		})
++	}
++}
