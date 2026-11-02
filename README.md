@@ -35,8 +35,9 @@ Its assets are replaced when `MetaCubeX/mihomo:Alpha` changes.
 
 Alpha asset names include the build version, for example:
 
-- `mihomo-linux-arm64-alpha-<short-sha>.gz` — with gVisor
-- `mihomo-linux-arm64-nogvisor-alpha-<short-sha>.gz` — without gVisor
+- `mihomo-linux-arm64-alpha-<short-sha>.gz` — without gVisor
+
+Each target has one build. There is no separate `nogvisor` artifact.
 
 The rolling release replaces these assets on each new Alpha build, so their
 names change together with the upstream commit.
@@ -51,58 +52,49 @@ same version tag and title, for example:
 Stable releases are normally never replaced. A manual workflow run can force a
 rebuild if required.
 
-## Build tags
-
-The upstream workflow produces two Linux variants for every Linux target:
-
-- normal: `with_gvisor,no_easytier,no_tailscale,no_zerotier`
-- lightweight `nogvisor`: `no_easytier,no_tailscale,no_zerotier`
-
-There is no separate `no_gvisor` build tag. The lightweight variant disables
-gVisor simply by omitting `with_gvisor`. Alpha and v1.19.31 provide all three
-`no_easytier`, `no_tailscale`, and `no_zerotier` constraints. Version v1.19.30
-predates EasyTier, so `no_easytier` is a harmless no-op there; the other two
-constraints are present.
-
-Both variants append `-slim` to the version embedded in the executable. For
-example, the API and `mihomo -v` report `v1.19.31-slim`, while archive names keep
-the original upstream version format.
-
-Each release also contains an upstream-compatible `version.txt`. It stores the
-build version without the downstream `-slim` suffix: for example, `v1.19.31` for
-a stable release or `alpha-<short-sha>` for an Alpha build. As in the upstream
-workflow, `version.txt` is not included in `checksums.txt`.
-
-Release notes start with a `Slim build` section that links directly to the exact
-upstream commit, summarizes the downstream changes and lists the available build
-variants. When the upstream release tag resolves to that same commit, its
-original release notes are appended under a separate heading. This SHA check
-prevents a moving Alpha release from contributing notes for a different build.
-The patched source tree is preserved in the attached source archive. Failure to
-fetch upstream notes does not fail an otherwise successful build.
-
-`custom-core-source.tar.gz` contains the patched source, a dated downstream
-modification notice, and its vendored Go dependencies. The same dependencies are
-also published separately as `vendor.tar.gz`, matching the upstream release
-convention. A copy of the upstream GPL-3.0 `LICENSE` is attached directly to the
-release as well as being included in the source archive.
-
 ## Files in this repository
 
 - `.github/workflows/sync.yml` — nightly version detection and orchestration.
 - `.github/workflows/build.yml` — placeholder so GitHub registers the workflow
   path on the default branch. Temporary `build/*` branches contain upstream's
   full, patched `build.yml`.
-- `patches/0001-build-without-easytier-tailscale.patch` — removes EasyTier,
-  Tailscale and ZeroTier from upstream tests and regular builds.
-- `patches/0002-add-linux-nogvisor-build.patch` — adds lightweight Linux builds
-  without gVisor.
-- `patches/0003-disable-upstream-publishing.patch` — disables upstream release and
+- `patches/0001-disable-upstream-publishing.patch` — disables upstream release and
   Docker jobs; publishing is handled by the builder workflow.
-- `patches/0004-disable-core-self-update.patch` — disables only the core
+- `patches/0002-disable-core-self-update.patch` — disables only the core
   self-update API; UI and GEO database updates remain available.
-- `patches/0005-use-utls-v1.9.0-mod-meta.patch` — pins MetaCubeX/utls to the
+- `patches/0003-use-utls-v1.9.0-mod-meta.patch` — pins MetaCubeX/utls to the
   `v1.9.0-mod-meta` branch revision.
+- `patches/0004-disable-trusttunnel.patch` — disables TrustTunnel inbound and outbound.
+- `patches/0005-disable-hysteria1.patch` — disables Hysteria 1 outbound, including FakeTCP.
+- `patches/0006-disable-shadowquic.patch` — disables ShadowQUIC inbound and outbound.
+- `patches/0007-disable-openvpn.patch` — disables OpenVPN outbound.
+- `patches/0008-disable-shadowsocksr.patch` — disables ShadowsocksR outbound.
+- `patches/0009-disable-debug-http.patch` — isolates HTTP debug handlers behind
+  `no_debug_http` and tests the API, UI, authentication, and debug routes.
+- `patches/0010-restrict-tun-stacks.patch` — removes `gvisor` and `mixed` from the
+  TUN stack mapping and tests YAML/JSON decoding; numeric enum IDs remain unchanged.
+- `patches/0011-add-connections-count-api.patch` — adds HTTP and WebSocket
+  `/connections/count` without collecting connection snapshots. Both return
+  `{"count":N}` under the existing API authentication. WebSocket sends immediately
+  and then every `interval` milliseconds (default 1000, accepted range 100–60000).
+- `patches/0012-add-socks5-resolve-destination.patch` — adds the downstream-only option
+  `resolve-destination: true` (default: false)
+  for SOCKS5 TCP destinations through the existing core DNS resolver and
+  `ip-version` policy. It reuses a known destination IP and keeps shared metadata
+  intact. SOCKS5 UDP already resolves locally. DNS transports using this outbound
+  directly use the existing bootstrap-resolution path to avoid recursive lookups.
+  Destination lookup uses the main DNS policy, not `direct-nameserver` or
+  `proxy-server-nameserver`; the latter still resolves the SOCKS server itself.
+  The selected destination IP follows the existing UDP address-selection helper;
+  TCP sends one IP in CONNECT rather than racing multiple destination addresses.
+  With `dialer-proxy`, the option applies to this SOCKS hop's destination;
+  for an intermediate SOCKS hop, that destination is the next proxy server.
+- `patches/0013-skip-disabled-provider-proxies.patch` — skips provider nodes whose
+  protocols are excluded from the build, with a warning. Other parse errors remain
+  fatal. An update with no usable nodes fails and keeps the previous provider list.
+- `patches/0014-use-protocol-exclusions.patch` — centrally enables all nine
+  exclusion tags, omits gVisor in the single build and test run, and preserves
+  the `-slim` runtime version suffix. Snell inbound and outbound remain available.
 - `scripts/build-upstream.sh` — creates the temporary source branch, dispatches
   the original CI, waits for it, publishes assets, then removes that branch.
 
