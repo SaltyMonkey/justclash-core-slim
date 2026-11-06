@@ -1,0 +1,140 @@
+Fix the spelling of the custom TLS certificate configuration key.
+Source: https://github.com/MetaCubeX/mihomo/issues/3351
+
+Use custom-certificates for YAML/JSON decoding and encoding, and in the example.
+Tests use marker strings and do not load certificate or private-key files.
+
+diff --git a/config/config.go b/config/config.go
+--- a/config/config.go
++++ b/config/config.go
+@@ -393,12 +393,14 @@
+ }
+ 
+ type RawTLS struct {
+-	Certificate     string   `yaml:"certificate" json:"certificate"`
+-	PrivateKey      string   `yaml:"private-key" json:"private-key"`
+-	ClientAuthType  string   `yaml:"client-auth-type" json:"client-auth-type"`
+-	ClientAuthCert  string   `yaml:"client-auth-cert" json:"client-auth-cert"`
+-	EchKey          string   `yaml:"ech-key" json:"ech-key"`
+-	CustomTrustCert []string `yaml:"custom-certifactes" json:"custom-certifactes"`
++	Certificate    string `yaml:"certificate" json:"certificate"`
++	PrivateKey     string `yaml:"private-key" json:"private-key"`
++	ClientAuthType string `yaml:"client-auth-type" json:"client-auth-type"`
++	ClientAuthCert string `yaml:"client-auth-cert" json:"client-auth-cert"`
++	EchKey         string `yaml:"ech-key" json:"ech-key"`
++	// Use the canonical spelling; a configuration key should not require a typo.
++	// See https://github.com/MetaCubeX/mihomo/issues/3351.
++	CustomTrustCert []string `yaml:"custom-certificates" json:"custom-certificates"`
+ }
+ 
+ type RawConfig struct {
+diff --git a/config/custom_certificates_test.go b/config/custom_certificates_test.go
+new file mode 100644
+--- /dev/null
++++ b/config/custom_certificates_test.go
+@@ -0,0 +1,97 @@
++package config
++
++import (
++	"encoding/json"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/metacubex/mihomo/common/yaml"
++)
++
++func TestCustomCertificatesKeyDecode(t *testing.T) {
++	for _, tc := range []struct {
++		name         string
++		certificates []string
++	}{
++		{"configured", []string{"test-certificate-marker"}},
++		{"empty", []string{}},
++		{"unset", nil},
++	} {
++		for _, format := range []string{"yaml", "json"} {
++			t.Run(tc.name+"/"+format, func(t *testing.T) {
++				fields := map[string]any{"client-auth-type": "request"}
++				if tc.certificates != nil {
++					fields["custom-certificates"] = tc.certificates
++				}
++				input := map[string]any{"tls": fields}
++				raw := DefaultRawConfig()
++				if format == "yaml" {
++					data, err := yaml.Marshal(input)
++					if err != nil {
++						t.Fatal("could not encode YAML fixture")
++					}
++					raw, err = UnmarshalRawConfig(data)
++					if err != nil {
++						t.Fatal("could not decode YAML fixture")
++					}
++				} else {
++					data, err := json.Marshal(input)
++					if err != nil {
++						t.Fatal("could not encode JSON fixture")
++					}
++					if err = json.Unmarshal(data, raw); err != nil {
++						t.Fatal("could not decode JSON fixture")
++					}
++				}
++				tls, err := parseTLS(raw)
++				if err != nil {
++					t.Fatal("could not parse TLS settings")
++				}
++				if !reflect.DeepEqual(tls.CustomTrustCert, tc.certificates) {
++					t.Fatal("canonical custom certificate key was not decoded")
++				}
++				if tls.ClientAuthType != "request" {
++					t.Fatal("unrelated TLS setting changed")
++				}
++			})
++		}
++	}
++}
++
++func TestCustomCertificatesCanonicalEncoding(t *testing.T) {
++	value := RawTLS{CustomTrustCert: []string{"test-certificate-marker"}}
++	for _, format := range []string{"yaml", "json"} {
++		var data []byte
++		var err error
++		if format == "yaml" {
++			data, err = yaml.Marshal(value)
++		} else {
++			data, err = json.Marshal(value)
++		}
++		if err != nil {
++			t.Fatal("could not encode TLS settings")
++		}
++		if !strings.Contains(string(data), "custom-certificates") {
++			t.Fatal("TLS settings were not encoded with the canonical key")
++		}
++	}
++}
++
++func TestCustomCertificatesInvalidValue(t *testing.T) {
++	input := map[string]any{"tls": map[string]any{"custom-certificates": 42}}
++	data, err := yaml.Marshal(input)
++	if err != nil {
++		t.Fatal("could not encode YAML fixture")
++	}
++	if _, err = UnmarshalRawConfig(data); err == nil {
++		t.Fatal("invalid YAML value was silently accepted")
++	}
++	data, err = json.Marshal(input)
++	if err != nil {
++		t.Fatal("could not encode JSON fixture")
++	}
++	if err = json.Unmarshal(data, DefaultRawConfig()); err == nil {
++		t.Fatal("invalid JSON value was silently accepted")
++	}
++}
+diff --git a/docs/config.yaml b/docs/config.yaml
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -60,3 +60,3 @@
+   #   -----END ECH KEYS-----
+-  custom-certifactes:
++  custom-certificates:
+     - |

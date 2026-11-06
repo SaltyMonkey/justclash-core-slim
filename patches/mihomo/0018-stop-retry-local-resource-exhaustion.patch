@@ -1,0 +1,192 @@
+Stop dial retries when the local host has exhausted socket resources.
+Retrying the same failure cannot replenish sockets, descriptors or buffers.
+Ordinary network failures retain their existing retry behavior.
+
+Based on upstream PR #3062:
+https://github.com/MetaCubeX/mihomo/pull/3062
+
+diff --git a/tunnel/retry_error_unix.go b/tunnel/retry_error_unix.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/retry_error_unix.go
+@@ -0,0 +1,15 @@
++//go:build !windows
++
++package tunnel
++
++import (
++	"errors"
++	"syscall"
++)
++
++func isLocalResourceExhaustion(err error) bool {
++	return errors.Is(err, syscall.EADDRNOTAVAIL) ||
++		errors.Is(err, syscall.EMFILE) ||
++		errors.Is(err, syscall.ENFILE) ||
++		errors.Is(err, syscall.ENOBUFS)
++}
+diff --git a/tunnel/retry_error_windows.go b/tunnel/retry_error_windows.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/retry_error_windows.go
+@@ -0,0 +1,16 @@
++//go:build windows
++
++package tunnel
++
++import (
++	"errors"
++
++	"golang.org/x/sys/windows"
++)
++
++func isLocalResourceExhaustion(err error) bool {
++	return errors.Is(err, windows.WSAEADDRNOTAVAIL) ||
++		errors.Is(err, windows.WSAEMFILE) ||
++		errors.Is(err, windows.ERROR_TOO_MANY_OPEN_FILES) ||
++		errors.Is(err, windows.WSAENOBUFS)
++}
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -721,6 +721,11 @@ func getRules(metadata *C.Metadata) []C.Rule {
+ }
+ 
+ func shouldStopRetry(err error) bool {
++	// Retrying cannot conjure up local sockets or descriptors.
++	// See https://github.com/MetaCubeX/mihomo/pull/3062.
++	if isLocalResourceExhaustion(err) {
++		return true
++	}
+ 	if errors.Is(err, resolver.ErrIPNotFound) {
+ 		return true
+ 	}
+diff --git a/tunnel/retry_error_test.go b/tunnel/retry_error_test.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/retry_error_test.go
+@@ -0,0 +1,86 @@
++package tunnel
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"os"
++	"testing"
++)
++
++func TestRetryStopsOnLocalResourceExhaustion(t *testing.T) {
++	for index, resourceErr := range localResourceErrors() {
++		cases := []struct {
++			name string
++			err  error
++		}{
++			{"direct", resourceErr},
++			{"wrapped", fmt.Errorf("dial failed: %w", resourceErr)},
++			{"syscall", &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("socket", resourceErr)}},
++			{"joined", errors.Join(errors.New("another dial failed"), resourceErr)},
++		}
++		for _, tc := range cases {
++			t.Run(fmt.Sprintf("resource-%d/%s", index, tc.name), func(t *testing.T) {
++				attempts, notifications := 0, 0
++				_, err := retry[int](context.Background(), func(context.Context) (int, error) {
++					attempts++
++					return 0, tc.err
++				}, func(error) {
++					notifications++
++				})
++				if attempts != 1 || notifications != 1 {
++					t.Fatalf("got %d attempts and %d notifications, want one each", attempts, notifications)
++				}
++				if !errors.Is(err, resourceErr) {
++					t.Fatal("retry did not preserve the resource error")
++				}
++			})
++		}
++	}
++}
++
++func TestLocalResourceExhaustionClassification(t *testing.T) {
++	for _, err := range []error{
++		nil,
++		errors.New("ordinary network failure"),
++		context.Canceled,
++		context.DeadlineExceeded,
++		net.ErrClosed,
++		os.ErrPermission,
++	} {
++		if isLocalResourceExhaustion(err) {
++			t.Fatal("an unrelated error was classified as resource exhaustion")
++		}
++	}
++}
++
++func TestRetryContinuesAfterTransientDialError(t *testing.T) {
++	transient := errors.New("temporary dial failure")
++	attempts, notifications := 0, 0
++	value, err := retry[int](context.Background(), func(context.Context) (int, error) {
++		attempts++
++		if attempts == 1 {
++			return 0, transient
++		}
++		return 42, nil
++	}, func(error) {
++		notifications++
++	})
++	if err != nil || value != 42 || attempts != 2 || notifications != 1 {
++		t.Fatal("a transient failure did not retain the normal retry behavior")
++	}
++}
++
++func TestRetryResourceCheckPreservesSuccess(t *testing.T) {
++	attempts, notifications := 0, 0
++	value, err := retry[int](context.Background(), func(context.Context) (int, error) {
++		attempts++
++		return 42, nil
++	}, func(error) {
++		notifications++
++	})
++	if err != nil || value != 42 || attempts != 1 || notifications != 0 {
++		t.Fatal("a successful dial did not retain the normal retry behavior")
++	}
++}
+diff --git a/tunnel/retry_error_unix_test.go b/tunnel/retry_error_unix_test.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/retry_error_unix_test.go
+@@ -0,0 +1,14 @@
++//go:build !windows
++
++package tunnel
++
++import "syscall"
++
++func localResourceErrors() []error {
++	return []error{
++		syscall.EADDRNOTAVAIL,
++		syscall.EMFILE,
++		syscall.ENFILE,
++		syscall.ENOBUFS,
++	}
++}
+diff --git a/tunnel/retry_error_windows_test.go b/tunnel/retry_error_windows_test.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/retry_error_windows_test.go
+@@ -0,0 +1,14 @@
++//go:build windows
++
++package tunnel
++
++import "golang.org/x/sys/windows"
++
++func localResourceErrors() []error {
++	return []error{
++		windows.WSAEADDRNOTAVAIL,
++		windows.WSAEMFILE,
++		windows.ERROR_TOO_MANY_OPEN_FILES,
++		windows.WSAENOBUFS,
++	}
++}

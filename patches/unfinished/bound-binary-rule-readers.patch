@@ -1,0 +1,409 @@
+Bound binary trie/CIDR lengths and allocate only for decoded elements.
+Inspired by the binary reader hardening in Citrus PR #16:
+https://github.com/getmikan/Citrus/pull/16
+
+Keep the existing binary format and error paths. Bound trie element counts to
+2^28 and CIDR range counts to 2^26. Append successfully decoded elements rather
+than preallocating an array from a file header. Read label bytes through a
+LimitedReader and check that the full declared payload was available.
+
+This focused change covers DomainSet, DomainMap and IpCidrSet readers.
+Regression tests cover length bounds, overflow panics, bounded allocation for
+short inputs, matching, byte-for-byte round trips and reader boundaries.
+
+diff --git a/component/trie/domain_set_bin.go b/component/trie/domain_set_bin.go
+--- a/component/trie/domain_set_bin.go
++++ b/component/trie/domain_set_bin.go
+@@ -5,6 +5,9 @@
+ 	"errors"
+ 	"io"
+ )
++
++// A header length is not a reservation for the entire heap.
++const maxBinLength = 1 << 28
+ 
+ func (ss *DomainSet) WriteBin(w io.Writer) (err error) {
+ 	// version
+@@ -69,15 +72,16 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if length < 1 {
++	if length < 1 || length > maxBinLength {
+ 		return nil, errors.New("length is invalid")
+ 	}
+-	ds.leaves = make([]uint64, length)
+ 	for i := int64(0); i < length; i++ {
+-		err = binary.Read(r, binary.BigEndian, &ds.leaves[i])
++		var value uint64
++		err = binary.Read(r, binary.BigEndian, &value)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		ds.leaves = append(ds.leaves, value)
+ 	}
+ 
+ 	// labelBitmap
+@@ -85,15 +89,16 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if length < 1 {
++	if length < 1 || length > maxBinLength {
+ 		return nil, errors.New("length is invalid")
+ 	}
+-	ds.labelBitmap = make([]uint64, length)
+ 	for i := int64(0); i < length; i++ {
+-		err = binary.Read(r, binary.BigEndian, &ds.labelBitmap[i])
++		var value uint64
++		err = binary.Read(r, binary.BigEndian, &value)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		ds.labelBitmap = append(ds.labelBitmap, value)
+ 	}
+ 
+ 	// labels
+@@ -101,13 +106,19 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if length < 1 {
++	if length < 1 || length > maxBinLength {
+ 		return nil, errors.New("length is invalid")
+ 	}
+-	ds.labels = make([]byte, length)
+-	_, err = io.ReadFull(r, ds.labels)
++	ds.labels, err = io.ReadAll(io.LimitReader(r, length))
+ 	if err != nil {
+ 		return nil, err
++	}
++
++	if int64(len(ds.labels)) != length {
++		if len(ds.labels) == 0 {
++			return nil, io.EOF
++		}
++		return nil, io.ErrUnexpectedEOF
+ 	}
+ 
+ 	ds.init()
+diff --git a/component/trie/domain_map_bin.go b/component/trie/domain_map_bin.go
+--- a/component/trie/domain_map_bin.go
++++ b/component/trie/domain_map_bin.go
+@@ -69,16 +69,17 @@
+ 	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+ 		return nil, err
+ 	}
+-	if length < 1 {
++	if length < 1 || length > maxBinLength {
+ 		return nil, errors.New("length is invalid")
+ 	}
+-	mapping := &DomainMap[T]{values: make([]T, length)}
++	mapping := &DomainMap[T]{}
+ 	mapping.index.DomainSet = set
+-	for index := range mapping.values {
+-		mapping.values[index], err = readValue(reader)
++	for index := int64(0); index < length; index++ {
++		value, err := readValue(reader)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		mapping.values = append(mapping.values, value)
+ 	}
+ 
+ 	// init
+diff --git a/component/cidr/ipcidr_set_bin.go b/component/cidr/ipcidr_set_bin.go
+--- a/component/cidr/ipcidr_set_bin.go
++++ b/component/cidr/ipcidr_set_bin.go
+@@ -8,6 +8,8 @@
+ 
+ 	"go4.org/netipx"
+ )
++
++const maxBinLength = 1 << 26
+ 
+ func (ss *IpCidrSet) WriteBin(w io.Writer) (err error) {
+ 	// version
+@@ -54,10 +56,9 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if length < 1 {
++	if length < 1 || length > maxBinLength {
+ 		return nil, errors.New("length is invalid")
+ 	}
+-	ss.rr = make([]netipx.IPRange, length)
+ 	for i := int64(0); i < length; i++ {
+ 		var a16 [16]byte
+ 		err = binary.Read(r, binary.BigEndian, &a16)
+@@ -70,7 +71,7 @@
+ 			return nil, err
+ 		}
+ 		to := netip.AddrFrom16(a16).Unmap()
+-		ss.rr[i] = netipx.IPRangeFrom(from, to)
++		ss.rr = append(ss.rr, netipx.IPRangeFrom(from, to))
+ 	}
+ 
+ 	return ss, nil
+diff --git a/component/trie/bin_bounds_test.go b/component/trie/bin_bounds_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/trie/bin_bounds_test.go
+@@ -0,0 +1,169 @@
++package trie
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"io"
++	"runtime"
++	"testing"
++)
++
++func binLengthFixture(stage int, length int64) []byte {
++	var data bytes.Buffer
++	data.WriteByte(1)
++	for i := 0; i < stage; i++ {
++		binary.Write(&data, binary.BigEndian, int64(1))
++		binary.Write(&data, binary.BigEndian, uint64(0))
++	}
++	binary.Write(&data, binary.BigEndian, length)
++	return data.Bytes()
++}
++
++func binMapFixture(t *testing.T, length int64) []byte {
++	t.Helper()
++	tree := New[bool]()
++	if err := tree.Insert("synthetic", true); err != nil {
++		t.Fatal(err)
++	}
++	var data bytes.Buffer
++	if err := tree.NewDomainSet().WriteBin(&data); err != nil {
++		t.Fatal(err)
++	}
++	data.WriteByte(0)
++	data.WriteByte(1)
++	binary.Write(&data, binary.BigEndian, length)
++	return data.Bytes()
++}
++
++func readBinTestValue(r io.Reader) (uint64, error) {
++	var value uint64
++	err := binary.Read(r, binary.BigEndian, &value)
++	return value, err
++}
++
++func binReadCases(t *testing.T, length int64) map[string]func() error {
++	t.Helper()
++	cases := make(map[string]func() error)
++	for stage, name := range []string{"leaves", "bitmap", "labels"} {
++		data := binLengthFixture(stage, length)
++		cases[name] = func() error { _, err := ReadDomainSetBin(bytes.NewReader(data)); return err }
++	}
++	data := binMapFixture(t, length)
++	cases["map-values"] = func() error { _, err := ReadDomainMapBin(bytes.NewReader(data), readBinTestValue); return err }
++	return cases
++}
++
++func TestBinaryReaderLengthBounds(t *testing.T) {
++	for _, length := range []int64{-1, 0, (1 << 28) + 1} {
++		for name, read := range binReadCases(t, length) {
++			t.Run(name, func(t *testing.T) {
++				if read() == nil {
++					t.Fatal("invalid binary length was accepted")
++				}
++			})
++		}
++	}
++	// The inclusive upper bound is valid, but its absent payload is truncated.
++	for name, read := range binReadCases(t, 1<<28) {
++		t.Run(name+"-maximum", func(t *testing.T) {
++			err := read()
++			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
++				t.Fatal("maximum length did not reach payload validation")
++			}
++		})
++	}
++}
++
++func TestBinaryReaderOverflowHeader(t *testing.T) {
++	for name, read := range binReadCases(t, 1<<63-1) {
++		t.Run(name, func(t *testing.T) {
++			defer func() {
++				if recover() != nil {
++					t.Error("binary header caused an allocation panic")
++				}
++			}()
++			if read() == nil {
++				t.Fatal("overflowing binary length was accepted")
++			}
++		})
++	}
++}
++
++func TestBinaryReaderDoesNotPreallocateClaimedLength(t *testing.T) {
++	// Old code allocates 1-8 MiB for these header-only fixtures. Keep this bounded
++	// so the regression check itself does not try to eat the machine's memory.
++	for name, read := range binReadCases(t, 1<<20) {
++		t.Run(name, func(t *testing.T) {
++			var before, after runtime.MemStats
++			runtime.ReadMemStats(&before)
++			err := read()
++			runtime.ReadMemStats(&after)
++			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
++				t.Fatal("truncated payload did not return an EOF error")
++			}
++			if after.TotalAlloc-before.TotalAlloc > 256<<10 {
++				t.Fatal("reader allocated memory for data absent from the input")
++			}
++		})
++	}
++}
++
++func TestBinaryReaderRoundTrip(t *testing.T) {
++	var builder DomainMapBuilder[uint64]
++	for name, value := range map[string]uint64{"synthetic-a": 11, "+.synthetic-b": 22} {
++		if err := builder.Insert(name, value); err != nil {
++			t.Fatal(err)
++		}
++	}
++	mapping := builder.Build()
++	for _, mapValues := range []bool{false, true} {
++		var data bytes.Buffer
++		if mapValues {
++			if err := mapping.WriteBin(&data, func(w io.Writer, v uint64) error { return binary.Write(w, binary.BigEndian, v) }); err != nil {
++				t.Fatal(err)
++			}
++		} else if err := mapping.DomainSet().WriteBin(&data); err != nil {
++			t.Fatal(err)
++		}
++		original := append([]byte(nil), data.Bytes()...)
++		data.WriteByte(0x7e)
++		if mapValues {
++			got, err := ReadDomainMapBin(&data, readBinTestValue)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if v, ok := got.Lookup("synthetic-a"); !ok || v != 11 {
++				t.Fatal("exact mapping changed")
++			}
++			if v, ok := got.Lookup("child.synthetic-b"); !ok || v != 22 {
++				t.Fatal("suffix mapping changed")
++			}
++			var encoded bytes.Buffer
++			if err = got.WriteBin(&encoded, func(w io.Writer, v uint64) error { return binary.Write(w, binary.BigEndian, v) }); err != nil {
++				t.Fatal(err)
++			}
++			if !bytes.Equal(encoded.Bytes(), original) {
++				t.Fatal("binary map format changed")
++			}
++		} else {
++			got, err := ReadDomainSetBin(&data)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !got.Has("synthetic-a") || !got.Has("child.synthetic-b") || got.Has("synthetic-other") {
++				t.Fatal("domain matching changed")
++			}
++			var encoded bytes.Buffer
++			if err = got.WriteBin(&encoded); err != nil {
++				t.Fatal(err)
++			}
++			if !bytes.Equal(encoded.Bytes(), original) {
++				t.Fatal("binary set format changed")
++			}
++		}
++		if data.Len() != 1 {
++			t.Fatal("binary reader consumed data beyond its payload")
++		}
++	}
++}
+diff --git a/component/cidr/bin_bounds_test.go b/component/cidr/bin_bounds_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/cidr/bin_bounds_test.go
+@@ -0,0 +1,83 @@
++package cidr
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"io"
++	"net/netip"
++	"runtime"
++	"testing"
++)
++
++func cidrLengthFixture(length int64) *bytes.Reader {
++	var data bytes.Buffer
++	data.WriteByte(1)
++	binary.Write(&data, binary.BigEndian, length)
++	return bytes.NewReader(data.Bytes())
++}
++
++func TestBinaryCidrLengthBounds(t *testing.T) {
++	for _, length := range []int64{-1, 0, (1 << 26) + 1} {
++		if _, err := ReadIpCidrSet(cidrLengthFixture(length)); err == nil {
++			t.Fatal("invalid binary range count was accepted")
++		}
++	}
++	if _, err := ReadIpCidrSet(cidrLengthFixture(1 << 26)); !errors.Is(err, io.EOF) {
++		t.Fatal("maximum range count did not reach payload validation")
++	}
++}
++
++func TestBinaryCidrOverflowHeader(t *testing.T) {
++	defer func() {
++		if recover() != nil {
++			t.Error("binary range count caused an allocation panic")
++		}
++	}()
++	if _, err := ReadIpCidrSet(cidrLengthFixture(1<<63 - 1)); err == nil {
++		t.Fatal("overflowing range count was accepted")
++	}
++}
++
++func TestBinaryCidrDoesNotPreallocateClaimedLength(t *testing.T) {
++	reader := cidrLengthFixture(1 << 17)
++	var before, after runtime.MemStats
++	runtime.ReadMemStats(&before)
++	_, err := ReadIpCidrSet(reader)
++	runtime.ReadMemStats(&after)
++	if !errors.Is(err, io.EOF) {
++		t.Fatal("missing ranges did not return EOF")
++	}
++	if after.TotalAlloc-before.TotalAlloc > 256<<10 {
++		t.Fatal("reader allocated memory for absent ranges")
++	}
++}
++
++func TestBinaryCidrRoundTrip(t *testing.T) {
++	set := NewIpCidrSet()
++	inside := netip.AddrFrom4([4]byte{198, 18, 0, 1})
++	outside := netip.AddrFrom4([4]byte{198, 19, 0, 1})
++	if err := set.AddIpCidr(netip.PrefixFrom(inside, 24)); err != nil {
++		t.Fatal(err)
++	}
++	var data bytes.Buffer
++	if err := set.WriteBin(&data); err != nil {
++		t.Fatal(err)
++	}
++	original := append([]byte(nil), data.Bytes()...)
++	data.WriteByte(0x7e)
++	got, err := ReadIpCidrSet(&data)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !got.IsContain(inside) || got.IsContain(outside) {
++		t.Fatal("range membership changed")
++	}
++	var encoded bytes.Buffer
++	if err = got.WriteBin(&encoded); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(encoded.Bytes(), original) || data.Len() != 1 {
++		t.Fatal("binary range format or reader boundary changed")
++	}
++}

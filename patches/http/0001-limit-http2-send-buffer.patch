@@ -1,0 +1,208 @@
+Limit HTTP/2 request-body scratch buffers to 32 KiB.
+Based on the prizrak-http implementation used by Prizrak-Core:
+https://github.com/legiz-ru/prizrak-http/commit/da5b4c1e0882
+
+Apply the same cap to the bundled HTTP/2 client in h2_bundle.go and the
+standalone client in http2/transport.go. Retain the peer frame-size and
+request content-length bounds; this does not limit the total request size.
+Include in-memory upload tests for both clients and large advertised frames.
+
+diff --git a/h2_bundle.go b/h2_bundle.go
+--- a/h2_bundle.go
++++ b/h2_bundle.go
+@@ -9133,9 +9133,11 @@
+ // outgoing request bodies to read/write to/from.
+ //
+ // It returns max(1, min(peer's advertised max frame size,
+-// Request.ContentLength+1, 512KB)).
++// Request.ContentLength+1, 32KB)).
+ func (cs *http2clientStream) frameScratchBufferLen(maxFrameSize int) int {
+-	const max = 512 << 10
++	// Keep upload scratch buffers modest, even when the peer advertises huge frames.
++	// https://github.com/legiz-ru/prizrak-http/commit/da5b4c1e0882
++	const max = 32 << 10
+ 	n := int64(maxFrameSize)
+ 	if n > max {
+ 		n = max
+@@ -9150,7 +9152,7 @@
+ 	if n < 1 {
+ 		return 1
+ 	}
+-	return int(n) // doesn't truncate; max is 512K
++	return int(n) // doesn't truncate; max is 32K
+ }
+ 
+ // Seven bufPools manage different frame sizes. This helps to avoid scenarios where long-running
+@@ -9158,7 +9160,7 @@
+ // requests needing big buffers. The size ranges are as follows:
+ // {0 KB, 16 KB], {16 KB, 32 KB], {32 KB, 64 KB], {64 KB, 128 KB], {128 KB, 256 KB],
+ // {256 KB, 512 KB], {512 KB, infinity}
+-// In practice, the maximum scratch buffer size should not exceed 512 KB due to
++// In practice, the maximum scratch buffer size should not exceed 32 KB due to
+ // frameScratchBufferLen(maxFrameSize), thus the "infinity pool" should never be used.
+ // It exists mainly as a safety measure, for potential future increases in max buffer size.
+ var http2bufPools [7]sync.Pool // of *[]byte
+diff --git a/http2/transport.go b/http2/transport.go
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -1818,9 +1818,11 @@
+ // outgoing request bodies to read/write to/from.
+ //
+ // It returns max(1, min(peer's advertised max frame size,
+-// Request.ContentLength+1, 512KB)).
++// Request.ContentLength+1, 32KB)).
+ func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
+-	const max = 512 << 10
++	// Keep upload scratch buffers modest, even when the peer advertises huge frames.
++	// https://github.com/legiz-ru/prizrak-http/commit/da5b4c1e0882
++	const max = 32 << 10
+ 	n := int64(maxFrameSize)
+ 	if n > max {
+ 		n = max
+@@ -1835,7 +1837,7 @@
+ 	if n < 1 {
+ 		return 1
+ 	}
+-	return int(n) // doesn't truncate; max is 512K
++	return int(n) // doesn't truncate; max is 32K
+ }
+ 
+ // Seven bufPools manage different frame sizes. This helps to avoid scenarios where long-running
+@@ -1843,7 +1845,7 @@
+ // requests needing big buffers. The size ranges are as follows:
+ // {0 KB, 16 KB], {16 KB, 32 KB], {32 KB, 64 KB], {64 KB, 128 KB], {128 KB, 256 KB],
+ // {256 KB, 512 KB], {512 KB, infinity}
+-// In practice, the maximum scratch buffer size should not exceed 512 KB due to
++// In practice, the maximum scratch buffer size should not exceed 32 KB due to
+ // frameScratchBufferLen(maxFrameSize), thus the "infinity pool" should never be used.
+ // It exists mainly as a safety measure, for potential future increases in max buffer size.
+ var bufPools [7]sync.Pool // of *[]byte
+diff --git a/downstreamtests/send_buffer_test.go b/downstreamtests/send_buffer_test.go
+new file mode 100644
+--- /dev/null
++++ b/downstreamtests/send_buffer_test.go
+@@ -0,0 +1,124 @@
++package downstreamtests
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/http2"
++	"github.com/metacubex/tls"
++)
++
++type measuredBody struct {
++	*bytes.Reader
++	maxRead atomic.Int64
++}
++
++func (b *measuredBody) Read(p []byte) (int, error) {
++	for old := b.maxRead.Load(); int64(len(p)) > old; old = b.maxRead.Load() {
++		if b.maxRead.CompareAndSwap(old, int64(len(p))) {
++			break
++		}
++	}
++	return b.Reader.Read(p)
++}
++
++// Exercise both HTTP/2 clients against a peer advertising large frames.
++// Measuring actual body reads catches a missed copy of the bundled implementation.
++func TestHTTP2RequestBodyBuffer(t *testing.T) {
++	for _, standalone := range []bool{false, true} {
++		for _, frameSize := range []uint32{16 << 10, 1 << 20} {
++			t.Run(fmt.Sprintf("standalone=%t/frame=%d", standalone, frameSize), func(t *testing.T) {
++				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++				defer cancel()
++				clientConn, serverConn := net.Pipe()
++				deadline, _ := ctx.Deadline()
++				clientConn.SetDeadline(deadline)
++				serverConn.SetDeadline(deadline)
++				payload := bytes.Repeat([]byte("synthetic-upload"), 8192)
++				done := make(chan struct{})
++				server := &http2.Server{
++					MaxReadFrameSize:             frameSize,
++					MaxUploadBufferPerConnection: 1 << 20,
++					MaxUploadBufferPerStream:     1 << 20,
++				}
++				go func() {
++					defer close(done)
++					server.ServeConn(serverConn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++						if r.Method == "POST" {
++							body, err := io.ReadAll(r.Body)
++							if err != nil || !bytes.Equal(body, payload) {
++								w.WriteHeader(400)
++								return
++							}
++						}
++						w.WriteHeader(204)
++					})})
++				}()
++				var dialed atomic.Bool
++				dial := func(context.Context, string, string) (net.Conn, error) {
++					if dialed.Swap(true) {
++						return nil, fmt.Errorf("unexpected second connection")
++					}
++					return clientConn, nil
++				}
++				var transport interface {
++					http.RoundTripper
++					CloseIdleConnections()
++				}
++				if standalone {
++					transport = &http2.Transport{AllowHTTP: true, DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
++						return dial(ctx, network, addr)
++					}}
++				} else {
++					protocols := new(http.Protocols)
++					protocols.SetUnencryptedHTTP2(true)
++					transport = &http.Transport{Protocols: protocols, DialContext: dial}
++				}
++				defer func() {
++					transport.CloseIdleConnections()
++					clientConn.Close()
++					serverConn.Close()
++					<-done
++				}()
++				client := &http.Client{Transport: transport}
++				request := func(method string, body io.Reader) {
++					t.Helper()
++					req, err := http.NewRequestWithContext(ctx, method, "http://buffer.invalid/upload", body)
++					if err != nil {
++						t.Fatal(err)
++					}
++					if body != nil {
++						req.ContentLength = -1
++					}
++					resp, err := client.Do(req)
++					if err != nil {
++						t.Fatal(err)
++					}
++					io.Copy(io.Discard, resp.Body)
++					resp.Body.Close()
++					if resp.StatusCode != 204 {
++						t.Fatalf("response status = %d", resp.StatusCode)
++					}
++				}
++				// Wait for the peer's SETTINGS before allocating the upload buffer.
++				request("GET", nil)
++				body := &measuredBody{Reader: bytes.NewReader(payload)}
++				request("POST", body)
++				want := int64(32 << 10)
++				if int64(frameSize) < want {
++					want = int64(frameSize)
++				}
++				if got := body.maxRead.Load(); got != want {
++					t.Fatalf("largest body read = %d, want %d", got, want)
++				}
++			})
++		}
++	}
++}

@@ -1,190 +1,122 @@
-# JustClash Core Builder
+# JustClash Core Slim
 
-Unofficial downstream build automation for MetaCubeX/mihomo. This repository is
-not affiliated with, endorsed by, or maintained by the upstream project.
+A streamlined mihomo core for the JustClash project, intended for routers and
+other devices with limited resources. Optional protocols and components are
+excluded to reduce the binary size and dependencies.
 
-It does **not** keep a persistent mirror of the upstream codebase. Once per day
-the workflow checks:
+The core can also be used independently of JustClash with a mihomo-compatible
+configuration, subject to the differences below. This is an unofficial version;
+it is not affiliated with or maintained by MetaCubeX.
 
-- `MetaCubeX/mihomo:Alpha`
-- the latest stable GitHub release
+## Standalone use
 
-When a new version is found it:
+Download the binary for your platform from Releases, unpack it and run it with
+your configuration and data directory:
 
-1. clones the exact upstream ref into a temporary runner directory;
-2. applies every `patches/*.patch`;
-3. temporarily pushes the patched source to a `build/*` branch;
-4. runs MetaCubeX/mihomo's original `.github/workflows/build.yml`;
-5. downloads the resulting build artifacts;
-6. attaches the corresponding patched source as `custom-core-source.tar.gz`
-   and the vendored Go dependencies as `vendor.tar.gz`;
-7. publishes/updates the downstream release while keeping the original versioned `mihomo-*` binary names and upstream-compatible `version.txt`;
-8. deletes the temporary `build/*` branch.
+```sh
+./mihomo -d ./data -f ./config.yaml
+```
 
-## Release policy
+Standard proxy listeners, routing rules, DNS, fake IP, TPROXY, supported TUN
+stacks, the controller API and web UI remain available. Hysteria 2, Shadowsocks
+and Snell are supported.
 
-### Alpha
+## Removed functionality
 
-There is only one rolling prerelease:
+- EasyTier, Tailscale and ZeroTier.
+- TrustTunnel, Hysteria 1 (including FakeTCP), ShadowQUIC, OpenVPN and ShadowsocksR.
+- gVisor and the `mixed` TUN stack. TUN accepts only `system` and `mips`;
+  unsupported stack settings are rejected. HTTP/SOCKS mixed listeners remain
+  available.
+- HTTP `/debug` endpoints. Ordinary logging remains available.
+- Core self-update through the controller API. Update the binary through
+  JustClash or replace it manually. UI and GEO database updates remain available.
+- Extraction of rule providers from `BundleMRS.7z`. Ordinary local and remote
+  rule-provider sources, including individual MRS files, remain supported.
 
-`Prerelease-Alpha`
+Proxy providers skip nodes using excluded protocols and report a warning. An
+update with no supported nodes fails and keeps the previous provider list.
+Other configuration errors remain errors, including an explicitly configured
+unsupported proxy outside a provider.
 
-Both its tag and release title are `Prerelease-Alpha`, matching upstream.
+## Added functionality
 
-Its assets are replaced when `MetaCubeX/mihomo:Alpha` changes.
+- **Connection-count API:** `GET /connections/count` returns `{"count":N}`
+  without collecting the full connection list. WebSocket clients receive the
+  count immediately and then at `interval` milliseconds: default 1000, accepted
+  range 100–60000. The endpoint uses the existing controller authentication.
+- **Local destination resolution for SOCKS5:** `resolve-destination: true` on a
+  SOCKS5 outbound resolves TCP destination names through the core's main DNS
+  resolver before connecting through the proxy. It respects `ip-version` and
+  defaults to `false`. `proxy-server-nameserver` still resolves the SOCKS server;
+  this option does not use `direct-nameserver` for destination lookups.
+- **Least-connections balancing:** `strategy: least-connections` in a
+  `load-balance` group selects an available node with the fewest active
+  connections relative to its share. TCP connections and UDP sessions count
+  together, including pending connection attempts. Repeating a node in an
+  explicit `proxies` list increases its share; filtering can deduplicate entries.
+  The strategy does not keep sessions on one exit and does not support `hash-key`.
 
-Alpha asset names include the build version, for example:
+## Other differences
 
-- `mihomo-linux-arm64-alpha-<short-sha>.gz` — without gVisor
+- **Persistent fake IP:** mappings and allocation progress are saved together,
+  including replacement cleanup. Restarting the core or reloading the same range
+  no longer depends on a separate allocation checkpoint. Persistence requires
+  `profile.store-fake-ip: true` and a writable cache file. To retain it across a
+  router reboot, keep the data directory on persistent storage: `/tmp` is cleared
+  on reboot.
+- **URL-test selection:** provider refreshes rebind the selected node to the
+  current instance, the first candidate is included, tolerance arithmetic avoids
+  overflow, and concurrent selection updates are synchronized.
+- **XHTTP compatibility:** corrected path/query handling, default padding and
+  selected `sc-*` values for zero ranges, and import of numeric/string ranges
+  and download XMUX settings from `extra`.
+- **Controller behavior:** `/memory` reports actual usage from the first message.
+  Individual proxy delay tests stop when their API request is cancelled.
+  Request headers and TLS handshakes have a 15-second timeout, idle keep-alive
+  connections close after 2 minutes, and the header-size limit is 256 KiB.
+  Active requests and streaming responses have no overall read/write timeout.
+- **TPROXY UDP cleanup:** local sockets are released after 60 seconds of
+  inactivity, with coordinated cleanup when sockets are replaced.
+- **Connection retries:** local socket resource exhaustion stops repeated dial
+  attempts instead of immediately retrying the same resource failure.
+- **HTTP/2 memory use:** the request-body scratch-buffer limit is 32 KiB per
+  sending stream. This is not a limit on request size or connection throughput.
+- **Custom TLS certificates:** the configuration key is `custom-certificates`.
 
-Each target has one build. There is no separate `nogvisor` artifact.
+## Releases
 
-The rolling release replaces these assets on each new Alpha build, so their
-names change together with the upstream commit.
+Stable releases follow upstream version tags. `Prerelease-Alpha` is the rolling
+prerelease; its assets are replaced when a new Alpha version is published.
+Runtime versions have a `-slim` suffix. Each target has one build without gVisor.
 
-### Stable
+Releases include the corresponding source in `custom-core-source.tar.gz` and
+Go dependency sources in `vendor.tar.gz` alongside the binaries.
 
-Each upstream stable release creates a separate downstream release using the
-same version tag and title, for example:
+## License
 
-`v1.19.31`
+JustClash Core Slim is based on [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)
+and is distributed under the [GNU General Public License, version 3](LICENSE).
+This is an unofficial distribution, not an official MetaCubeX release.
 
-Stable releases are normally never replaced. A manual workflow run can force a
-rebuild if required.
+Some changes adapt work from mihomo contributors and other projects, including
+[Citrus](https://github.com/getmikan/Citrus) and
+[prizrak-http](https://github.com/legiz-ru/prizrak-http). Those contributions remain
+the work of their respective authors. Source references are retained with the
+relevant changes; this project does not claim sole authorship of incorporated
+code or ownership of the original projects, names or trademarks.
 
-## Files in this repository
+The core also includes third-party libraries and other components. Each retains
+its applicable license, copyright notices and attribution requirements. The
+top-level GPL license does not replace their individual license texts or remove
+their notices. Original license and notice files are retained with the
+corresponding source, including locally modified dependencies.
 
-- `.github/workflows/sync.yml` — nightly version detection and orchestration.
-- `.github/workflows/build.yml` — placeholder so GitHub registers the workflow
-  path on the default branch. Temporary `build/*` branches contain upstream's
-  full, patched `build.yml`.
-- `patches/0001-disable-upstream-publishing.patch` — disables upstream release and
-  Docker jobs; publishing is handled by the builder workflow.
-- `patches/0002-disable-core-self-update.patch` — disables only the core
-  self-update API; UI and GEO database updates remain available.
-- `patches/0003-use-utls-v1.9.0-mod-meta.patch` — pins MetaCubeX/utls to the
-  `v1.9.0-mod-meta` branch revision.
-- `patches/0004-disable-trusttunnel.patch` — disables TrustTunnel inbound and outbound.
-- `patches/0005-disable-hysteria1.patch` — disables Hysteria 1 outbound, including FakeTCP.
-- `patches/0006-disable-shadowquic.patch` — disables ShadowQUIC inbound and outbound.
-- `patches/0007-disable-openvpn.patch` — disables OpenVPN outbound.
-- `patches/0008-disable-shadowsocksr.patch` — disables ShadowsocksR outbound.
-- `patches/0009-disable-debug-http.patch` — isolates HTTP debug handlers behind
-  `no_debug_http` and tests the API, UI, authentication, and debug routes.
-- `patches/0010-restrict-tun-stacks.patch` — removes `gvisor` and `mixed` from the
-  TUN stack mapping and tests YAML/JSON decoding; numeric enum IDs remain unchanged.
-- `patches/0011-add-connections-count-api.patch` — adds HTTP and WebSocket
-  `/connections/count` without collecting connection snapshots. Both return
-  `{"count":N}` under the existing API authentication. WebSocket sends immediately
-  and then every `interval` milliseconds (default 1000, accepted range 100–60000).
-- `patches/0012-add-socks5-resolve-destination.patch` — adds the downstream-only option
-  `resolve-destination: true` (default: false)
-  for SOCKS5 TCP destinations through the existing core DNS resolver and
-  `ip-version` policy. It reuses a known destination IP and keeps shared metadata
-  intact. SOCKS5 UDP already resolves locally. DNS transports using this outbound
-  directly use the existing bootstrap-resolution path to avoid recursive lookups.
-  Destination lookup uses the main DNS policy, not `direct-nameserver` or
-  `proxy-server-nameserver`; the latter still resolves the SOCKS server itself.
-  The selected destination IP follows the existing UDP address-selection helper;
-  TCP sends one IP in CONNECT rather than racing multiple destination addresses.
-  With `dialer-proxy`, the option applies to this SOCKS hop's destination;
-  for an intermediate SOCKS hop, that destination is the next proxy server.
-- `patches/0013-skip-disabled-provider-proxies.patch` — skips provider nodes whose
-  protocols are excluded from the build, with a warning. Other parse errors remain
-  fatal. An update with no usable nodes fails and keeps the previous provider list.
-- `patches/0014-use-protocol-exclusions.patch` — centrally enables all nine
-  exclusion tags, omits gVisor in the single build and test run, and preserves
-  the `-slim` runtime version suffix. Snell inbound and outbound remain available.
-- `scripts/build-upstream.sh` — creates the temporary source branch, dispatches
-  the original CI, waits for it, publishes assets, then removes that branch.
+Each binary release includes the corresponding core source in
+`custom-core-source.tar.gz` and dependency sources in `vendor.tar.gz`.
+Modification information is recorded in `DOWNSTREAM.md` within the source
+distribution. When redistributing, preserve the applicable licenses, notices
+and source availability required by those licenses.
 
-## Setup
-
-Create an empty public GitHub repository with a name that does not use the word
-`mihomo`, unpack these files into it, commit and push them to the default branch.
-
-Then open:
-
-Settings -> Actions -> General -> Workflow permissions
-
-and allow read/write permissions if your repository or organization policy does
-not allow the explicit workflow permissions to grant them.
-
-The builder also needs a token that is allowed to create and update workflow
-files. The built-in `GITHUB_TOKEN` cannot push the patched upstream
-`.github/workflows/build.yml` to the temporary `build/*` branch, even when
-`contents: write` and `actions: write` are enabled.
-
-Create a repository secret named `BUILDER_TOKEN`. Prefer a fine-grained token
-limited to this repository with read/write access to Contents and Actions, plus
-write access to Workflows. A classic token needs repository access
-(`public_repo` for a public repository, or `repo` where appropriate) together
-with the `workflow` scope.
-The token is used only by the Alpha and stable build jobs; version detection
-continues to use the built-in `GITHUB_TOKEN`.
-
-Never commit the token to this repository or place it in workflow arguments.
-Store it only as the `BUILDER_TOKEN` Actions secret and rotate it before it
-expires.
-
-The build script attributes its temporary patched-source commit to the standard
-Actions bot identity by default. Manual callers can override it with
-`--git-user-name` and `--git-user-email`. These values are applied only to the
-single `git commit-tree` invocation; the cloned repository's Git configuration
-is not modified.
-
-## Patch safety and reproducibility
-
-The nightly build deliberately fails if an upstream change makes the patch stop
-applying. That is preferable to silently publishing a binary built with
-different options.
-
-The release contains `custom-core-source.tar.gz`, a corresponding-source
-snapshot assembled from the patched commit and the canonical packaging job. It
-includes vendored Go dependencies. Transient runner state and regenerated build
-data, such as the refreshed CA bundle, are reproducibly described by the patched
-workflow rather than included in this archive.
-
-## Upstream ownership and licensing
-
-This repository does not claim ownership of MetaCubeX/mihomo, its name, source
-code, version numbers, release metadata, documentation, or other upstream
-materials. All rights to the upstream project and its releases remain with their
-respective authors and copyright holders. Releases published by this repository
-are unofficial downstream rebuilds and must not be presented as official
-MetaCubeX/mihomo releases.
-
-MetaCubeX/mihomo is distributed under the GNU General Public License version 3
-(GPL-3.0). A verbatim copy of the upstream license is included in [`LICENSE`](LICENSE).
-This downstream repository and its patches follow the same GPL-3.0 terms.
-
-Bundled third-party components remain subject to their own licenses, copyright
-notices, and attribution requirements. The corresponding source distributed
-with each binary release retains those files and notices and includes a dated
-`DOWNSTREAM.md` describing the modifications. Nothing in this repository
-replaces, overrides, or grants rights beyond the applicable upstream and
-third-party licenses.
-
-Each release provides the corresponding patched source in
-`custom-core-source.tar.gz` and the standalone `vendor.tar.gz` alongside the
-modified binaries. Keep those source archives, the license text, and all
-copyright notices available when redistributing a build.
-
-## Disclaimer
-
-This project and its release artifacts are provided "as is", without warranties
-of any kind, express or implied. Builds are automated and may contain upstream
-defects, downstream patch defects, security vulnerabilities, regressions, or
-platform-specific incompatibilities.
-
-You use the scripts, source code, binaries, networking features, and update
-mechanisms entirely at your own risk. You are responsible for reviewing the
-source and configuration, testing the build in your environment, protecting
-your data, and complying with all laws, licenses, service terms, and network
-policies applicable to you.
-
-To the maximum extent permitted by applicable law, the maintainer and
-contributors of this repository are not liable for any direct or indirect loss,
-data loss, service interruption, security incident, account restriction, or
-other damage resulting from the use of, or inability to use, this project or its
-release artifacts.
+The software is provided without warranty, as described in the applicable
+licenses.

@@ -1,0 +1,719 @@
+Add the least-connections load-balance strategy.
+Based on upstream PR: https://github.com/MetaCubeX/mihomo/pull/3328
+Source commit: 878bf4bf900f6eab0dd1d51b0f67dc7cc3e20607
+
+Reserve a member when a TCP/UDP dial starts and release it on dial failure or
+connection close. Repeated members carry proportionate shares; dead members
+are skipped, ties rotate and Unwrap reports without reserving. Reject hash-key
+for this strategy. Existing strategies keep their original selection behavior.
+
+Keep each group's least-connections state in its strategy closure. All strategies
+use the same (proxy, optional release) result; selection touch and connection
+acquisition are separate flags. Strategies without connection accounting return
+nil release, so their connections need no additional close wrapper.
+
+Retain the upstream selection algorithm and cover weighted selection, TCP/UDP
+lifetime, dial failures, duplicate close, pending dials, concurrent reservation
+and release, member replacement, per-group isolation, Unwrap and legacy strategy
+contracts. Enable explicitly with strategy: least-connections; it counts
+connections and does not measure throughput/latency or pin sessions.
+
+diff --git a/adapter/outboundgroup/loadbalance.go b/adapter/outboundgroup/loadbalance.go
+--- a/adapter/outboundgroup/loadbalance.go
++++ b/adapter/outboundgroup/loadbalance.go
+@@ -32,7 +32,10 @@
+ 	expectedStatus string
+ }
+ 
+-type strategyFn = func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy
++// touch preserves selection side effects; acquire reserves a real connection.
++// Reporting through Unwrap must not quietly open an accounting tab.
++// A nil release means that the strategy needs no connection accounting.
++type strategyFn = func(proxies []C.Proxy, metadata *C.Metadata, touch, acquire bool) (C.Proxy, func())
+ 
+ var errStrategy = errors.New("unsupported strategy")
+ var errHashKey = errors.New("unsupported hash-key")
+@@ -118,14 +121,23 @@
+ 	return int32(b)
+ }
+ 
++// pick chooses the member for a new connection. The returned release must be
++// called once that connection is gone (or never came up), unless it is nil.
++func (lb *LoadBalance) pick(metadata *C.Metadata) (C.Proxy, func()) {
++	return lb.strategyFn(lb.GetProxies(true), metadata, true, true)
++}
++
+ // DialContext implements C.ProxyAdapter
+ func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
+-	proxy := lb.Unwrap(metadata, true)
++	proxy, release := lb.pick(metadata)
+ 	c, err = proxy.DialContext(ctx, metadata)
+ 
+ 	if err == nil {
+ 		c.AppendToChains(lb)
+ 	} else {
++		if release != nil {
++			release()
++		}
+ 		lb.onDialFailed(proxy.Type(), err, lb.healthCheck)
+ 	}
+ 
+@@ -139,6 +151,10 @@
+ 		})
+ 	}
+ 
++	if err == nil && release != nil {
++		c = callback.NewCloseCallbackConn(c, release)
++	}
++
+ 	return
+ }
+ 
+@@ -150,8 +166,18 @@
+ 		}
+ 	}()
+ 
+-	proxy := lb.Unwrap(metadata, true)
+-	return proxy.ListenPacketContext(ctx, metadata)
++	proxy, release := lb.pick(metadata)
++	pc, err = proxy.ListenPacketContext(ctx, metadata)
++	if err != nil {
++		if release != nil {
++			release()
++		}
++		return
++	}
++	if release != nil {
++		pc = callback.NewCloseCallbackPacketConn(pc, release)
++	}
++	return
+ }
+ 
+ // SupportUDP implements C.ProxyAdapter
+@@ -167,7 +193,7 @@
+ func strategyRoundRobin(url string) strategyFn {
+ 	idx := 0
+ 	idxMutex := sync.Mutex{}
+-	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
++	return func(proxies []C.Proxy, metadata *C.Metadata, touch, _ bool) (C.Proxy, func()) {
+ 		idxMutex.Lock()
+ 		defer idxMutex.Unlock()
+ 
+@@ -185,35 +211,35 @@
+ 			proxy := proxies[id]
+ 			if proxy.AliveForTestUrl(url) {
+ 				i++
+-				return proxy
+-			}
+-		}
+-
+-		return proxies[0]
++				return proxy, nil
++			}
++		}
++
++		return proxies[0], nil
+ 	}
+ }
+ 
+ func strategyConsistentHashing(url string, keyOf keyFn) strategyFn {
+ 	maxRetry := 5
+-	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
++	return func(proxies []C.Proxy, metadata *C.Metadata, touch, _ bool) (C.Proxy, func()) {
+ 		key := utils.MapHash(keyOf(metadata))
+ 		buckets := int32(len(proxies))
+ 		for i := 0; i < maxRetry; i, key = i+1, key+1 {
+ 			idx := jumpHash(key, buckets)
+ 			proxy := proxies[idx]
+ 			if proxy.AliveForTestUrl(url) {
+-				return proxy
++				return proxy, nil
+ 			}
+ 		}
+ 
+ 		// when availability is poor, traverse the entire list to get the available nodes
+ 		for _, proxy := range proxies {
+ 			if proxy.AliveForTestUrl(url) {
+-				return proxy
+-			}
+-		}
+-
+-		return proxies[0]
++				return proxy, nil
++			}
++		}
++
++		return proxies[0], nil
+ 	}
+ }
+ 
+@@ -223,7 +249,7 @@
+ 	lruCache := lru.New[uint64, int](
+ 		lru.WithAge[uint64, int](int64(ttl.Seconds())),
+ 		lru.WithSize[uint64, int](1000))
+-	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
++	return func(proxies []C.Proxy, metadata *C.Metadata, touch, _ bool) (C.Proxy, func()) {
+ 		key := utils.MapHash(keyOf(metadata))
+ 		length := len(proxies)
+ 		idx, has := lruCache.Get(key)
+@@ -239,21 +265,102 @@
+ 					lruCache.Set(key, nowIdx)
+ 				}
+ 
+-				return proxy
++				return proxy, nil
+ 			} else {
+ 				nowIdx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
+ 			}
+ 		}
+ 
+ 		lruCache.Set(key, 0)
+-		return proxies[0]
++		return proxies[0], nil
++	}
++}
++
++// Each group keeps its accounting state inside its strategy closure.
++func strategyLeastConnections(url string) strategyFn {
++	state := newLeastConnections()
++	return func(proxies []C.Proxy, metadata *C.Metadata, touch, acquire bool) (C.Proxy, func()) {
++		return state.pick(proxies, url, acquire)
++	}
++}
++
++// Based on https://github.com/MetaCubeX/mihomo/pull/3328.
++//
++// leastConnections hands each new connection to the alive member with the
++// fewest open connections per share. A member listed N times in the group
++// holds N shares, as it already gets N turns under round-robin; this is how a
++// faster link is given a larger part of the traffic. Unlike the hashing
++// strategies it spreads the connections of one destination too, which is what
++// a download split over parallel connections needs, at the cost of any
++// affinity: a destination that ties a session to the egress IP belongs in a
++// sticky group instead.
++//
++// A connection is counted from the moment its member is picked, not from when
++// the dial completes, so a burst of simultaneous requests spreads instead of
++// piling onto whichever member looked idlest.
++type leastConnections struct {
++	mu     sync.Mutex
++	active map[C.Proxy]int
++	next   int // rotates where the scan starts, so ties do not all go to the first member
++}
++
++func newLeastConnections() *leastConnections {
++	return &leastConnections{active: map[C.Proxy]int{}}
++}
++
++// pick returns the chosen member and, when acquire is set, counts a
++// connection on it; the returned release undoes that count and is safe to
++// call more than once.
++func (lc *leastConnections) pick(proxies []C.Proxy, url string, acquire bool) (C.Proxy, func()) {
++	lc.mu.Lock()
++	defer lc.mu.Unlock()
++
++	shares := make(map[C.Proxy]int, len(proxies))
++	for _, proxy := range proxies {
++		shares[proxy]++
++	}
++
++	length := len(proxies)
++	var best C.Proxy
++	bestActive, bestShares := 0, 0
++	for i := 0; i < length; i++ {
++		proxy := proxies[(lc.next+i)%length]
++		if !proxy.AliveForTestUrl(url) {
++			continue
++		}
++		// (active+1)/shares < (bestActive+1)/bestShares, kept in integers.
++		active, n := lc.active[proxy], shares[proxy]
++		if best == nil || (active+1)*bestShares < (bestActive+1)*n {
++			best, bestActive, bestShares = proxy, active, n
++		}
++	}
++	if best == nil {
++		best = proxies[0]
++	}
++
++	if !acquire {
++		return best, nil
++	}
++
++	lc.next = (lc.next + 1) % length
++	lc.active[best]++
++	var once sync.Once
++	return best, func() {
++		once.Do(func() {
++			lc.mu.Lock()
++			defer lc.mu.Unlock()
++			if lc.active[best]--; lc.active[best] <= 0 {
++				delete(lc.active, best)
++			}
++		})
+ 	}
+ }
+ 
+ // Unwrap implements C.ProxyAdapter
+ func (lb *LoadBalance) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+ 	proxies := lb.GetProxies(touch)
+-	return lb.strategyFn(proxies, metadata, touch)
++	proxy, _ := lb.strategyFn(proxies, metadata, touch, false)
++	return proxy
+ }
+ 
+ // MarshalJSON implements C.ProxyAdapter
+@@ -303,6 +410,12 @@
+ 		strategyFn = strategyRoundRobin(option.URL)
+ 	case "sticky-sessions":
+ 		strategyFn = strategyStickySessions(option.URL, withKey(getKeyWithSrcAndDst))
++	case "least-connections":
++		// Rejected for the same reason as round-robin: it hashes nothing.
++		if loadBalanceOption.HashKey != "" {
++			return nil, fmt.Errorf("%w: least-connections does not hash", errHashKey)
++		}
++		strategyFn = strategyLeastConnections(option.URL)
+ 	default:
+ 		return nil, fmt.Errorf("%w: %s", errStrategy, loadBalanceOption.Strategy)
+ 	}
+diff --git a/adapter/outboundgroup/loadbalance_test.go b/adapter/outboundgroup/loadbalance_test.go
+--- a/adapter/outboundgroup/loadbalance_test.go
++++ b/adapter/outboundgroup/loadbalance_test.go
+@@ -50,7 +50,7 @@
+ 	proxies := balancedProxies(8)
+ 	hosts := []string{"a.example.com", "b.example.org", "c.example.net", "d.example.io"}
+ 
+-	byUser := strategyConsistentHashing(testUrl, getKeyWithInUser(getKey))
++	byUser := selectForTest(t, strategyConsistentHashing(testUrl, getKeyWithInUser(getKey)))
+ 	pinned := indexOf(t, proxies, byUser(proxies, request("job-1", hosts[0]), false))
+ 	for _, host := range hosts {
+ 		selected := byUser(proxies, request("job-1", host), false)
+@@ -87,13 +87,13 @@
+ // address cannot separate its own concurrent jobs without a supplied identity.
+ func TestLoadBalanceHashKeyInUserSeparatesJobsSharingASourceAddress(t *testing.T) {
+ 	proxies := balancedProxies(8)
+-	strategy := strategyStickySessions(testUrl, getKeyWithInUser(getKeyWithSrcAndDst))
++	strategy := selectForTest(t, strategyStickySessions(testUrl, getKeyWithInUser(getKeyWithSrcAndDst)))
+ 
+ 	first := indexOf(t, proxies, strategy(proxies, request("job-1", "a.example.com"), false))
+ 	require.Equal(t, first,
+ 		indexOf(t, proxies, strategy(proxies, request("job-1", "b.example.org"), false)))
+ 
+-	shared := strategyStickySessions(testUrl, getKeyWithSrcAndDst)
++	shared := selectForTest(t, strategyStickySessions(testUrl, getKeyWithSrcAndDst))
+ 	require.Equal(t,
+ 		indexOf(t, proxies, shared(proxies, request("job-1", "a.example.com"), false)),
+ 		indexOf(t, proxies, shared(proxies, request("job-2", "a.example.com"), false)),
+@@ -141,3 +141,104 @@
+ 		LoadBalanceOption{Strategy: "consistent-hashing", HashKey: "nonsense"}, nil, nil)
+ 	require.ErrorIs(t, err, errHashKey)
+ }
++
++// Adapt selection-only assertions while checking the common release contract.
++func selectForTest(t *testing.T, strategy strategyFn) func([]C.Proxy, *C.Metadata, bool) C.Proxy {
++	t.Helper()
++	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
++		proxy, release := strategy(proxies, metadata, touch, false)
++		require.Nil(t, release)
++		return proxy
++	}
++}
++
++// deadProxy fails its health check, so every strategy must skip it.
++type deadProxy struct{ C.Proxy }
++
++func (deadProxy) AliveForTestUrl(string) bool { return false }
++
++func countPicks(t *testing.T, lc *leastConnections, proxies []C.Proxy, n int) ([]int, []func()) {
++	t.Helper()
++	counts := make([]int, len(proxies))
++	releases := make([]func(), 0, n)
++	for i := 0; i < n; i++ {
++		proxy, release := lc.pick(proxies, testUrl, true)
++		counts[indexOf(t, proxies, proxy)]++
++		releases = append(releases, release)
++	}
++	return counts, releases
++}
++
++// Connections of one destination must spread: this is the case the hashing
++// strategies cannot serve and the reason the strategy exists.
++func TestLoadBalanceLeastConnectionsSpreadsOpenConnections(t *testing.T) {
++	proxies := balancedProxies(3)
++	counts, _ := countPicks(t, newLeastConnections(), proxies, 9)
++	require.Equal(t, []int{3, 3, 3}, counts)
++}
++
++func TestLoadBalanceLeastConnectionsReusesAReleasedMember(t *testing.T) {
++	proxies := balancedProxies(3)
++	lc := newLeastConnections()
++	first, release := lc.pick(proxies, testUrl, true)
++	_, _ = countPicks(t, lc, proxies, 2) // one connection on every member
++
++	release()
++	release() // a second release must not free a connection that is still open
++	next, _ := lc.pick(proxies, testUrl, true)
++	require.Same(t, first, next, "the only member below the others must get the next connection")
++
++	_, _ = countPicks(t, lc, proxies, 3) // two on every member again
++	require.Equal(t, map[C.Proxy]int{proxies[0]: 2, proxies[1]: 2, proxies[2]: 2}, lc.active)
++}
++
++// A member listed twice holds two shares, the same weighting round-robin
++// already gives a repeated name.
++func TestLoadBalanceLeastConnectionsWeighsARepeatedMember(t *testing.T) {
++	members := balancedProxies(2)
++	fast, slow := members[0], members[1]
++	proxies := []C.Proxy{fast, fast, slow}
++	lc := newLeastConnections()
++	got := map[C.Proxy]int{}
++	for i := 0; i < 6; i++ {
++		proxy, _ := lc.pick(proxies, testUrl, true)
++		got[proxy]++
++	}
++	require.Equal(t, 4, got[fast])
++	require.Equal(t, 2, got[slow])
++}
++
++func TestLoadBalanceLeastConnectionsSkipsADeadMember(t *testing.T) {
++	alive := balancedProxies(2)
++	dead := deadProxy{balancedProxies(1)[0]}
++	proxies := []C.Proxy{dead, alive[0], alive[1]}
++	counts, _ := countPicks(t, newLeastConnections(), proxies, 4)
++	require.Equal(t, []int{0, 2, 2}, counts)
++
++	// With nobody alive the group still answers, like every other strategy.
++	allDead := []C.Proxy{deadProxy{alive[0]}, deadProxy{alive[1]}}
++	proxy, _ := newLeastConnections().pick(allDead, testUrl, true)
++	require.Equal(t, allDead[0], proxy)
++}
++
++// Unwrap reports a member without opening anything, so it must not count.
++func TestLoadBalanceLeastConnectionsReportingDoesNotCount(t *testing.T) {
++	proxies := balancedProxies(2)
++	lc := newLeastConnections()
++	for i := 0; i < 5; i++ {
++		_, release := lc.pick(proxies, testUrl, false)
++		require.Nil(t, release)
++	}
++	require.Empty(t, lc.active)
++}
++
++func TestLoadBalanceLeastConnectionsRejectsAHashKey(t *testing.T) {
++	_, err := NewLoadBalance(GroupCommonOption{Name: "lb"},
++		LoadBalanceOption{Strategy: "least-connections", HashKey: "in-user"}, nil, nil)
++	require.ErrorIs(t, err, errHashKey)
++
++	lb, err := NewLoadBalance(GroupCommonOption{Name: "lb"},
++		LoadBalanceOption{Strategy: "least-connections"}, nil, nil)
++	require.NoError(t, err)
++	require.NotNil(t, lb.strategyFn)
++}
+diff --git a/adapter/outboundgroup/loadbalance_lifecycle_test.go b/adapter/outboundgroup/loadbalance_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outboundgroup/loadbalance_lifecycle_test.go
+@@ -0,0 +1,304 @@
++package outboundgroup
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/stretchr/testify/require"
++)
++
++type leastTestProvider struct {
++	P.ProxyProvider
++	proxies []C.Proxy
++}
++
++func (p *leastTestProvider) Proxies() []C.Proxy { return p.proxies }
++func (*leastTestProvider) Version() uint32      { return 1 }
++func (*leastTestProvider) Touch()               {}
++
++type leastTestStream struct {
++	C.Conn
++	chains C.Chain
++}
++
++func (*leastTestStream) NeedHandshake() bool               { return false }
++func (*leastTestStream) Close() error                      { return nil }
++func (c *leastTestStream) AppendToChains(p C.ProxyAdapter) { c.chains = append(c.chains, p.Name()) }
++func (c *leastTestStream) Chains() C.Chain                 { return c.chains }
++
++type leastTestPacket struct {
++	C.PacketConn
++	chains C.Chain
++}
++
++func (*leastTestPacket) Close() error                      { return nil }
++func (c *leastTestPacket) AppendToChains(p C.ProxyAdapter) { c.chains = append(c.chains, p.Name()) }
++func (c *leastTestPacket) Chains() C.Chain                 { return c.chains }
++
++type leastTestProxy struct {
++	C.Proxy
++	name string
++	dial func() error
++}
++
++func (p *leastTestProxy) Name() string              { return p.name }
++func (*leastTestProxy) Type() C.AdapterType         { return C.Direct }
++func (*leastTestProxy) AliveForTestUrl(string) bool { return true }
++func (p *leastTestProxy) DialContext(context.Context, *C.Metadata) (C.Conn, error) {
++	if p.dial != nil {
++		if err := p.dial(); err != nil {
++			return nil, err
++		}
++	}
++	return &leastTestStream{chains: C.Chain{p.name}}, nil
++}
++func (p *leastTestProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
++	if p.dial != nil {
++		if err := p.dial(); err != nil {
++			return nil, err
++		}
++	}
++	return &leastTestPacket{chains: C.Chain{p.name}}, nil
++}
++
++func leastTestGroup(t *testing.T, proxies ...C.Proxy) *LoadBalance {
++	t.Helper()
++	provider := &leastTestProvider{proxies: proxies}
++	lb, err := NewLoadBalance(GroupCommonOption{Name: "least-test"},
++		LoadBalanceOption{Strategy: "least-connections"}, proxies[0], []P.ProxyProvider{provider})
++	require.NoError(t, err)
++	return lb
++}
++
++type leastTestConnection interface {
++	Close() error
++	Chains() C.Chain
++}
++
++func leastTestDial(lb *LoadBalance, network string) (leastTestConnection, error) {
++	if network == "tcp" {
++		return lb.DialContext(context.Background(), &C.Metadata{})
++	}
++	return lb.ListenPacketContext(context.Background(), &C.Metadata{})
++}
++
++func leastTestOpen(t *testing.T, lb *LoadBalance, network, want string) leastTestConnection {
++	t.Helper()
++	conn, err := leastTestDial(lb, network)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++	require.Equal(t, C.Chain{want, "least-test"}, conn.Chains())
++	return conn
++}
++
++func TestLoadBalanceLeastConnectionsDialLifecycle(t *testing.T) {
++	for _, network := range []string{"tcp", "udp"} {
++		for _, outcome := range []string{"success", "failure"} {
++			t.Run(network+"/"+outcome, func(t *testing.T) {
++				members := []C.Proxy{&leastTestProxy{name: "a"}, &leastTestProxy{name: "b"}, &leastTestProxy{name: "c"}}
++				lb := leastTestGroup(t, members...)
++				leastTestOpen(t, lb, network, "a")
++				leastTestOpen(t, lb, network, "b")
++				old := leastTestOpen(t, lb, network, "c")
++				require.NoError(t, old.Close())
++				// Only c is now free. Neither a successful dial nor a failed one
++				// gets a lifetime membership in the active counters.
++				if outcome == "failure" {
++					members[2].(*leastTestProxy).dial = func() error { return C.ErrNotSupport }
++					_, err := leastTestDial(lb, network)
++					require.ErrorIs(t, err, C.ErrNotSupport)
++					members[2].(*leastTestProxy).dial = nil
++				}
++				leastTestOpen(t, lb, network, "c")
++				if outcome == "success" {
++					require.NoError(t, old.Close())
++					// A duplicate close must not release the replacement connection.
++					leastTestOpen(t, lb, network, "b")
++				}
++			})
++		}
++	}
++}
++
++func TestLoadBalanceLeastConnectionsReservesBeforeDialCompletes(t *testing.T) {
++	for _, network := range []string{"tcp", "udp"} {
++		t.Run(network, func(t *testing.T) {
++			a, b, c := &leastTestProxy{name: "a"}, &leastTestProxy{name: "b"}, &leastTestProxy{name: "c"}
++			lb := leastTestGroup(t, a, b, c)
++			leastTestOpen(t, lb, network, "a")
++			leastTestOpen(t, lb, network, "b")
++			require.NoError(t, leastTestOpen(t, lb, network, "c").Close())
++			block := make(chan struct{}, 1)
++			block <- struct{}{}
++			started, unblock := make(chan struct{}), make(chan struct{})
++			c.dial = func() error {
++				select {
++				case <-block:
++					close(started)
++					<-unblock
++				default:
++				}
++				return nil
++			}
++			type result struct {
++				conn leastTestConnection
++				err  error
++			}
++			done := make(chan result, 1)
++			t.Cleanup(func() {
++				close(unblock)
++				select {
++				case r := <-done:
++					if r.err != nil {
++						t.Error(r.err)
++					}
++					if r.conn != nil {
++						_ = r.conn.Close()
++					}
++				case <-time.After(2 * time.Second):
++					t.Error("blocked dial did not finish")
++				}
++			})
++			go func() { conn, err := leastTestDial(lb, network); done <- result{conn, err} }()
++			select {
++			case <-started:
++			case <-time.After(2 * time.Second):
++				t.Fatal("dial did not start")
++			}
++			// The pending c dial is already counted. Equal counts rotate to b.
++			leastTestOpen(t, lb, network, "b")
++		})
++	}
++}
++
++func TestLoadBalanceLeastConnectionsUnwrapDoesNotReserve(t *testing.T) {
++	members := []C.Proxy{&leastTestProxy{name: "a"}, &leastTestProxy{name: "b"}}
++	lb := leastTestGroup(t, members...)
++	for i := 0; i < 10; i++ {
++		require.Same(t, members[0], lb.Unwrap(&C.Metadata{}, i%2 == 0))
++	}
++	leastTestOpen(t, lb, "tcp", "a")
++	for i := 0; i < 10; i++ {
++		require.Same(t, members[1], lb.Unwrap(&C.Metadata{}, i%2 == 0))
++	}
++	leastTestOpen(t, lb, "udp", "b")
++}
++
++func TestLoadBalanceLeastConnectionsClosureIsPerGroup(t *testing.T) {
++	proxies := balancedProxies(2)
++	first, second := strategyLeastConnections(testUrl), strategyLeastConnections(testUrl)
++	picked, release := first(proxies, &C.Metadata{}, true, true)
++	require.Same(t, proxies[0], picked)
++	t.Cleanup(release)
++	picked, release = second(proxies, &C.Metadata{}, true, true)
++	require.Same(t, proxies[0], picked, "a second group must not inherit the first group's counters")
++	t.Cleanup(release)
++	picked, release = first(proxies, &C.Metadata{}, true, true)
++	require.Same(t, proxies[1], picked, "calls to the same closure must share its counters")
++	t.Cleanup(release)
++}
++
++func TestLoadBalanceOtherStrategiesNeedNoRelease(t *testing.T) {
++	for _, name := range []string{"round-robin", "consistent-hashing", "sticky-sessions"} {
++		t.Run(name, func(t *testing.T) {
++			members := []C.Proxy{&leastTestProxy{name: "a"}, &leastTestProxy{name: "b"}}
++			provider := &leastTestProvider{proxies: members}
++			lb, err := NewLoadBalance(GroupCommonOption{Name: "least-test"}, LoadBalanceOption{Strategy: name}, members[0], []P.ProxyProvider{provider})
++			require.NoError(t, err)
++			for _, touch := range []bool{false, true} {
++				for _, acquire := range []bool{false, true} {
++					_, release := lb.strategyFn(members, &C.Metadata{}, touch, acquire)
++					require.Nil(t, release)
++				}
++			}
++			for _, network := range []string{"tcp", "udp"} {
++				conn, err := leastTestDial(lb, network)
++				require.NoError(t, err)
++				switch network {
++				case "tcp":
++					require.IsType(t, &leastTestStream{}, conn)
++				case "udp":
++					require.IsType(t, &leastTestPacket{}, conn)
++				}
++				require.NoError(t, conn.Close())
++			}
++			for _, member := range members {
++				member.(*leastTestProxy).dial = func() error { return C.ErrNotSupport }
++			}
++			for _, network := range []string{"tcp", "udp"} {
++				_, err := leastTestDial(lb, network)
++				require.ErrorIs(t, err, C.ErrNotSupport)
++			}
++		})
++	}
++}
++
++func TestLoadBalanceRoundRobinKeepsTouchSemantics(t *testing.T) {
++	proxies := balancedProxies(2)
++	strategy := strategyRoundRobin(testUrl)
++	check := func(touch, acquire bool, want C.Proxy) {
++		t.Helper()
++		got, release := strategy(proxies, &C.Metadata{}, touch, acquire)
++		require.Same(t, want, got)
++		require.Nil(t, release)
++	}
++	check(false, true, proxies[0])
++	check(false, false, proxies[0])
++	check(true, false, proxies[0])
++	check(false, false, proxies[1])
++}
++
++func TestLoadBalanceLeastConnectionsConcurrentReservations(t *testing.T) {
++	proxies := balancedProxies(3)
++	lc := newLeastConnections()
++	type reservation struct {
++		proxy   C.Proxy
++		release func()
++	}
++	held := make(chan reservation, 48)
++	var wg sync.WaitGroup
++	for i := 0; i < cap(held); i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			proxy, release := lc.pick(proxies, testUrl, true)
++			held <- reservation{proxy, release}
++		}()
++	}
++	wg.Wait()
++	close(held)
++	counts := map[C.Proxy]int{}
++	var releases []func()
++	for reservation := range held {
++		counts[reservation.proxy]++
++		releases = append(releases, reservation.release)
++	}
++	for _, proxy := range proxies {
++		require.Equal(t, 16, counts[proxy])
++	}
++	// Concurrent duplicate closes must still release every reservation once.
++	for _, release := range releases {
++		for i := 0; i < 2; i++ {
++			wg.Add(1)
++			go func(release func()) { defer wg.Done(); release() }(release)
++		}
++	}
++	wg.Wait()
++	require.Empty(t, lc.active)
++}
++
++func TestLoadBalanceLeastConnectionsMemberReplacement(t *testing.T) {
++	lc := newLeastConnections()
++	old, replacement := balancedProxies(1)[0], balancedProxies(1)[0]
++	_, releaseOld := lc.pick([]C.Proxy{old}, testUrl, true)
++	selected, releaseNew := lc.pick([]C.Proxy{replacement}, testUrl, true)
++	require.Same(t, replacement, selected)
++	releaseOld()
++	require.Equal(t, map[C.Proxy]int{replacement: 1}, lc.active)
++	releaseNew()
++	require.Empty(t, lc.active)
++}

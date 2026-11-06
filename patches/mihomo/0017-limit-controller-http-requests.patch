@@ -1,0 +1,358 @@
+Apply one controller HTTP policy to HTTP, TLS, Unix and named-pipe listeners.
+
+Use a shared constructor: ReadHeaderTimeout 15 seconds, IdleTimeout 2 minutes,
+MaxHeaderBytes 256 KiB, and no overall ReadTimeout or WriteTimeout for streams.
+
+Regression tests exercise real HTTP/TLS serving over net.Pipe. They observe the
+production deadlines before shortening only the test connection's waiting time.
+Cover incomplete headers, a stalled TLS handshake, idle keep-alive, accepted and
+oversized headers, a slow request body and a delayed streaming response.
+No IP-bound listeners or certificate/private-key files are used by the tests.
+
+diff --git a/hub/route/server.go b/hub/route/server.go
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -159,6 +159,17 @@
+ 	return r
+ }
+ 
++// newControllerServer keeps every controller transport on the same limits.
++// Four listeners do not need four opportunities to forget a timeout.
++func newControllerServer(handler http.Handler) *http.Server {
++	return &http.Server{
++		Handler:           handler,
++		ReadHeaderTimeout: 15 * time.Second,
++		IdleTimeout:       2 * time.Minute,
++		MaxHeaderBytes:    256 << 10,
++	}
++}
++
+ func start(cfg *Config) {
+ 	// first stop existing server
+ 	if httpServer != nil {
+@@ -177,9 +188,7 @@
+ 		}
+ 		log.Infoln("RESTful API listening at: %s", l.Addr().String())
+ 
+-		server := &http.Server{
+-			Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors),
+-		}
++		server := newControllerServer(router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors))
+ 		httpServer = server
+ 		if err = server.Serve(l); err != nil {
+ 			log.Errorln("External controller serve error: %s", err)
+@@ -238,9 +247,7 @@
+ 				return
+ 			}
+ 		}
+-		server := &http.Server{
+-			Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors),
+-		}
++		server := newControllerServer(router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors))
+ 		tlsServer = server
+ 		if err = server.Serve(tls.NewListener(l, tlsConfig)); err != nil {
+ 			log.Errorln("External controller tls serve error: %s", err)
+@@ -286,9 +293,7 @@
+ 		_ = os.Chmod(addr, 0o666)
+ 		log.Infoln("RESTful API unix listening at: %s", l.Addr().String())
+ 
+-		server := &http.Server{
+-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
+-		}
++		server := newControllerServer(router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors))
+ 		unixServer = server
+ 		if err = server.Serve(l); err != nil {
+ 			log.Errorln("External controller unix serve error: %s", err)
+@@ -317,9 +322,7 @@
+ 		}
+ 		log.Infoln("RESTful API pipe listening at: %s", l.Addr().String())
+ 
+-		server := &http.Server{
+-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
+-		}
++		server := newControllerServer(router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors))
+ 		pipeServer = server
+ 		if err = server.Serve(l); err != nil {
+ 			log.Errorln("External controller pipe serve error: %s", err)
+diff --git a/hub/route/server_limits_test.go b/hub/route/server_limits_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/server_limits_test.go
+@@ -0,0 +1,277 @@
++package route
++
++import (
++	"bufio"
++	"errors"
++	"io"
++	"log"
++	"net"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/tls"
++)
++
++const controllerDeadlineTestLimit = 150 * time.Millisecond
++
++type controllerDeadlineConn struct {
++	net.Conn
++	limit  time.Duration
++	reads  chan time.Duration
++	writes chan time.Duration
++}
++
++func (c *controllerDeadlineConn) recordDeadline(deadline time.Time, events chan time.Duration) time.Time {
++	duration := time.Duration(0)
++	if !deadline.IsZero() {
++		duration = time.Until(deadline)
++	}
++	select {
++	case events <- duration:
++	default:
++	}
++	// Keep the production deadline observable, without making a keep-alive test
++	// take two minutes merely to prove that two minutes were configured.
++	if !deadline.IsZero() && c.limit > 0 && duration > c.limit {
++		return time.Now().Add(c.limit)
++	}
++	return deadline
++}
++func (c *controllerDeadlineConn) SetReadDeadline(deadline time.Time) error {
++	return c.Conn.SetReadDeadline(c.recordDeadline(deadline, c.reads))
++}
++func (c *controllerDeadlineConn) SetWriteDeadline(deadline time.Time) error {
++	return c.Conn.SetWriteDeadline(c.recordDeadline(deadline, c.writes))
++}
++
++type controllerPipeListener struct {
++	conn      net.Conn
++	accepted  sync.Once
++	closeOnce sync.Once
++	closed    chan struct{}
++}
++
++func (l *controllerPipeListener) Accept() (net.Conn, error) {
++	var conn net.Conn
++	l.accepted.Do(func() { conn = l.conn })
++	if conn != nil {
++		return conn, nil
++	}
++	<-l.closed
++	return nil, net.ErrClosed
++}
++func (l *controllerPipeListener) Close() error {
++	l.closeOnce.Do(func() { close(l.closed) })
++	return nil
++}
++func (l *controllerPipeListener) Addr() net.Addr { return l.conn.LocalAddr() }
++
++func serveControllerTestPipe(t *testing.T, handler http.Handler, deadlineLimit time.Duration, secure bool) (net.Conn, *controllerDeadlineConn) {
++	t.Helper()
++	raw, client := net.Pipe()
++	tracked := &controllerDeadlineConn{Conn: raw, limit: deadlineLimit, reads: make(chan time.Duration, 32), writes: make(chan time.Duration, 32)}
++	var listener net.Listener = &controllerPipeListener{conn: tracked, closed: make(chan struct{})}
++	if secure {
++		// A silent TLS client needs no certificate or private-key fixture.
++		listener = tls.NewListener(listener, &tls.Config{})
++	}
++	server := newControllerServer(handler)
++	server.ErrorLog = log.New(io.Discard, "", 0)
++	done := make(chan struct{})
++	go func() { defer close(done); _ = server.Serve(listener) }()
++	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		server.Close()
++		client.Close()
++		tracked.Close()
++		listener.Close()
++		select {
++		case <-done:
++		case <-time.After(3 * time.Second):
++			t.Error("controller server did not stop")
++		}
++	})
++	return client, tracked
++}
++
++func waitControllerDeadline(t *testing.T, events <-chan time.Duration, expected time.Duration) {
++	t.Helper()
++	timer := time.NewTimer(3 * time.Second)
++	defer timer.Stop()
++	for {
++		select {
++		case actual := <-events:
++			if actual > expected-time.Second && actual < expected+time.Second {
++				return
++			}
++		case <-timer.C:
++			t.Fatal("HTTP server did not apply the configured deadline")
++		}
++	}
++}
++
++func expectControllerConnectionClosed(t *testing.T, conn net.Conn) {
++	t.Helper()
++	var buf [64]byte
++	for {
++		_, err := conn.Read(buf[:])
++		if err == nil {
++			continue
++		}
++		if errors.Is(err, io.EOF) {
++			return
++		}
++		t.Fatal("connection was not closed by the server before the client safety deadline")
++	}
++}
++
++func writeControllerTestRequest(t *testing.T, conn net.Conn, request string) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() { defer close(done); _, _ = io.WriteString(conn, request) }()
++	// A rejected request may interrupt its writer. Responses assert the result;
++	// cleanup joins the writer instead of leaving a goroutine as a souvenir.
++	t.Cleanup(func() {
++		conn.Close()
++		select {
++		case <-done:
++		case <-time.After(time.Second):
++			t.Error("request writer did not stop")
++		}
++	})
++}
++
++func readControllerTestResponse(t *testing.T, reader *bufio.Reader, method string) *http.Response {
++	t.Helper()
++	response, err := http.ReadResponse(reader, &http.Request{Method: method})
++	if err != nil {
++		t.Fatal("controller response could not be read")
++	}
++	return response
++}
++
++func TestControllerServerPolicy(t *testing.T) {
++	server := newControllerServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
++	if server.ReadHeaderTimeout != 15*time.Second {
++		t.Fatal("controller header timeout is not 15 seconds")
++	}
++	if server.IdleTimeout != 2*time.Minute {
++		t.Fatal("controller idle timeout is not two minutes")
++	}
++	if server.MaxHeaderBytes != 256<<10 {
++		t.Fatal("controller header limit is not 256 KiB")
++	}
++	if server.ReadTimeout != 0 || server.WriteTimeout != 0 {
++		t.Fatal("controller applies an overall timeout to streams")
++	}
++}
++
++func TestControllerClosesIncompleteHeaders(t *testing.T) {
++	client, tracked := serveControllerTestPipe(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("incomplete request reached the handler") }), controllerDeadlineTestLimit, false)
++	writeControllerTestRequest(t, client, "GET / HTTP/1.1\r\nHost: controller-test\r\nX-Incomplete:")
++	waitControllerDeadline(t, tracked.reads, 15*time.Second)
++	expectControllerConnectionClosed(t, client)
++}
++
++func TestControllerClosesStalledTLSHandshake(t *testing.T) {
++	client, tracked := serveControllerTestPipe(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("unfinished TLS handshake reached the handler") }), controllerDeadlineTestLimit, true)
++	waitControllerDeadline(t, tracked.reads, 15*time.Second)
++	waitControllerDeadline(t, tracked.writes, 15*time.Second)
++	expectControllerConnectionClosed(t, client)
++}
++
++func TestControllerClosesIdleKeepAlive(t *testing.T) {
++	client, tracked := serveControllerTestPipe(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }), controllerDeadlineTestLimit, false)
++	writeControllerTestRequest(t, client, "GET / HTTP/1.1\r\nHost: controller-test\r\n\r\n")
++	response := readControllerTestResponse(t, bufio.NewReader(client), http.MethodGet)
++	_, err := io.Copy(io.Discard, response.Body)
++	response.Body.Close()
++	if err != nil || response.StatusCode != http.StatusOK {
++		t.Fatal("initial keep-alive request failed")
++	}
++	waitControllerDeadline(t, tracked.reads, 2*time.Minute)
++	expectControllerConnectionClosed(t, client)
++}
++
++func TestControllerHeaderSizeLimit(t *testing.T) {
++	for _, test := range []struct {
++		name         string
++		size, status int
++	}{
++		{"below-limit", (256 << 10) - 1024, http.StatusOK},
++		// The HTTP parser reserves 4096 bytes of buffer slack.
++		{"above-limit", (256 << 10) + 8192, http.StatusRequestHeaderFieldsTooLarge},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			called := false
++			client, _ := serveControllerTestPipe(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; io.WriteString(w, "ok") }), 0, false)
++			writeControllerTestRequest(t, client, "GET / HTTP/1.1\r\nHost: controller-test\r\nX-Padding: "+strings.Repeat("a", test.size)+"\r\nConnection: close\r\n\r\n")
++			response := readControllerTestResponse(t, bufio.NewReader(client), http.MethodGet)
++			if response.StatusCode != test.status {
++				t.Fatal("unexpected status for request header size")
++			}
++			if _, err := io.Copy(io.Discard, response.Body); err != nil {
++				t.Fatal("header response could not be completed")
++			}
++			response.Body.Close()
++			if called != (test.status == http.StatusOK) {
++				t.Fatal("header acceptance and handler invocation disagree")
++			}
++		})
++	}
++}
++
++func TestControllerActiveRequestAndStreamHaveNoOverallTimeout(t *testing.T) {
++	firstRead, release := make(chan struct{}), make(chan struct{})
++	var once sync.Once
++	finish := func() { once.Do(func() { close(release) }) }
++	defer finish()
++	client, _ := serveControllerTestPipe(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var b [1]byte
++		if _, err := io.ReadFull(r.Body, b[:]); err != nil {
++			return
++		}
++		close(firstRead)
++		if _, err := io.ReadFull(r.Body, b[:]); err != nil {
++			return
++		}
++		io.WriteString(w, "first\n")
++		w.(http.Flusher).Flush()
++		select {
++		case <-release:
++		case <-r.Context().Done():
++			return
++		}
++		io.WriteString(w, "last\n")
++		w.(http.Flusher).Flush()
++	}), controllerDeadlineTestLimit, false)
++	writeControllerTestRequest(t, client, "POST / HTTP/1.1\r\nHost: controller-test\r\nContent-Length: 2\r\nConnection: close\r\n\r\na")
++	select {
++	case <-firstRead:
++	case <-time.After(3 * time.Second):
++		t.Fatal("request body did not reach the handler")
++	}
++	<-time.After(2 * controllerDeadlineTestLimit)
++	if _, err := io.WriteString(client, "b"); err != nil {
++		t.Fatal("active request body was cut off")
++	}
++	response := readControllerTestResponse(t, bufio.NewReader(client), http.MethodPost)
++	reader := bufio.NewReader(response.Body)
++	if line, err := reader.ReadString('\n'); err != nil || line != "first\n" {
++		t.Fatal("stream did not deliver its first chunk")
++	}
++	<-time.After(2 * controllerDeadlineTestLimit)
++	finish()
++	if line, err := reader.ReadString('\n'); err != nil || line != "last\n" {
++		t.Fatal("active stream was cut off")
++	}
++	if _, err := io.Copy(io.Discard, reader); err != nil {
++		t.Fatal("stream did not finish cleanly")
++	}
++	response.Body.Close()
++}

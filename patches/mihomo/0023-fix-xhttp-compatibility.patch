@@ -1,0 +1,634 @@
+Fix XHTTP compatibility with Xray and imported extra settings.
+Path/query handling: https://github.com/MetaCubeX/mihomo/pull/3318
+Source commit: db520c0a35e2426b3828c9bd5a402c1140ad3c2a
+Padding, ranges and extra import: https://github.com/getmikan/Citrus/pull/9
+Padding failure report: https://github.com/MetaCubeX/mihomo/issues/3068
+
+Split configured paths from their raw query and preserve both for every upload
+and download request, including separate download settings. Server path matching
+uses only the path. Query-bearing mihomo peers need this behavior at both ends.
+
+Treat zero-ended padding and selected sc-* ranges as unset, applying the Xray
+fallbacks: padding 100-1000 bytes, stream-up server interval 20-80 seconds,
+30 buffered posts, 1000000 bytes per post and a 30 ms post interval. Reject a
+post-size range with a zero minimum. Retain zero semantics for reuse settings.
+
+Import numeric or string XHTTP extra ranges consistently. Read download XMUX
+from xhttpSettings.xmux, with xhttpSettings.extra.xmux taking precedence.
+This patch covers configuration and wire-format compatibility, retaining the
+existing packet-up sending implementation and explicit reuse configuration.
+
+Tests cover all XHTTP modes, separate download queries, zero/default and invalid
+ranges, actual server acceptance of zero-configured padding, reuse zero values,
+and the complete extra-link conversion through proxy construction.
+
+diff --git a/transport/xhttp/client.go b/transport/xhttp/client.go
+--- a/transport/xhttp/client.go
++++ b/transport/xhttp/client.go
+@@ -108,9 +108,10 @@
+ 
+ func (c *PacketUpWriter) write(b []byte) (int, error) {
+ 	u := url.URL{
+-		Scheme: "https",
+-		Host:   c.cfg.Host,
+-		Path:   c.cfg.NormalizedPath(),
++		Scheme:   "https",
++		Host:     c.cfg.Host,
++		Path:     c.cfg.NormalizedPath(),
++		RawQuery: c.cfg.NormalizedQuery(),
+ 	}
+ 
+ 	req, err := http.NewRequestWithContext(c.ctx, c.cfg.GetNormalizedUplinkHTTPMethod(), u.String(), nil)
+@@ -346,9 +347,10 @@
+ 	}
+ 
+ 	requestURL := url.URL{
+-		Scheme: "https",
+-		Host:   c.cfg.Host,
+-		Path:   c.cfg.NormalizedPath(),
++		Scheme:   "https",
++		Host:     c.cfg.Host,
++		Path:     c.cfg.NormalizedPath(),
++		RawQuery: c.cfg.NormalizedQuery(),
+ 	}
+ 	pr, pw := io.Pipe()
+ 
+@@ -443,15 +445,17 @@
+ 	}
+ 
+ 	streamURL := url.URL{
+-		Scheme: "https",
+-		Host:   c.cfg.Host,
+-		Path:   c.cfg.NormalizedPath(),
++		Scheme:   "https",
++		Host:     c.cfg.Host,
++		Path:     c.cfg.NormalizedPath(),
++		RawQuery: c.cfg.NormalizedQuery(),
+ 	}
+ 
+ 	downloadURL := url.URL{
+-		Scheme: "https",
+-		Host:   downloadCfg.Host,
+-		Path:   downloadCfg.NormalizedPath(),
++		Scheme:   "https",
++		Host:     downloadCfg.Host,
++		Path:     downloadCfg.NormalizedPath(),
++		RawQuery: downloadCfg.NormalizedQuery(),
+ 	}
+ 	pr, pw := io.Pipe()
+ 
+@@ -587,9 +591,10 @@
+ 	sessionID := c.generateSessionID()
+ 
+ 	downloadURL := url.URL{
+-		Scheme: "https",
+-		Host:   downloadCfg.Host,
+-		Path:   downloadCfg.NormalizedPath(),
++		Scheme:   "https",
++		Host:     downloadCfg.Host,
++		Path:     downloadCfg.NormalizedPath(),
++		RawQuery: downloadCfg.NormalizedQuery(),
+ 	}
+ 
+ 	writerCtx, writerCancel := context.WithCancel(c.ctx)
+diff --git a/transport/xhttp/config.go b/transport/xhttp/config.go
+--- a/transport/xhttp/config.go
++++ b/transport/xhttp/config.go
+@@ -89,7 +89,9 @@
+ }
+ 
+ func (c *Config) NormalizedPath() string {
+-	path := c.Path
++	// Xray matches the path separately from its query.
++	// https://github.com/MetaCubeX/mihomo/pull/3318
++	path, _, _ := strings.Cut(c.Path, "?")
+ 	if path == "" {
+ 		path = "/"
+ 	}
+@@ -103,6 +105,11 @@
+ 		}
+ 	}
+ 	return path
++}
++
++func (c *Config) NormalizedQuery() string {
++	_, query, _ := strings.Cut(c.Path, "?")
++	return query
+ }
+ 
+ func (c *Config) GetRequestHeader() http.Header {
+@@ -194,7 +201,7 @@
+ }
+ 
+ func (c *Config) GetNormalizedScStreamUpServerSecs() (Range, error) {
+-	r, err := ParseRange(c.ScStreamUpServerSecs, "20-80")
++	r, err := ParseRangeOrDefault(c.ScStreamUpServerSecs, "20-80")
+ 	if err != nil {
+ 		return Range{}, fmt.Errorf("invalid sc-stream-up-server-secs: %w", err)
+ 	}
+@@ -202,34 +209,28 @@
+ }
+ 
+ func (c *Config) GetNormalizedScMaxBufferedPosts() (Range, error) {
+-	r, err := ParseRange(c.ScMaxBufferedPosts, "30")
++	r, err := ParseRangeOrDefault(c.ScMaxBufferedPosts, "30")
+ 	if err != nil {
+ 		return Range{}, fmt.Errorf("invalid sc-max-buffered-posts: %w", err)
+ 	}
+-	if r.Max == 0 {
+-		return Range{}, fmt.Errorf("invalid sc-max-buffered-posts: must be greater than zero")
+-	}
+ 	return r, nil
+ }
+ 
+ func (c *Config) GetNormalizedScMaxEachPostBytes() (Range, error) {
+-	r, err := ParseRange(c.ScMaxEachPostBytes, "1000000")
++	r, err := ParseRangeOrDefault(c.ScMaxEachPostBytes, "1000000")
+ 	if err != nil {
+ 		return Range{}, fmt.Errorf("invalid sc-max-each-post-bytes: %w", err)
+ 	}
+-	if r.Max == 0 {
++	if r.Min == 0 { // a zero-sized post would never carry any data
+ 		return Range{}, fmt.Errorf("invalid sc-max-each-post-bytes: must be greater than zero")
+ 	}
+ 	return r, nil
+ }
+ 
+ func (c *Config) GetNormalizedScMinPostsIntervalMs() (Range, error) {
+-	r, err := ParseRange(c.ScMinPostsIntervalMs, "30")
++	r, err := ParseRangeOrDefault(c.ScMinPostsIntervalMs, "30")
+ 	if err != nil {
+ 		return Range{}, fmt.Errorf("invalid sc-min-posts-interval-ms: %w", err)
+-	}
+-	if r.Max == 0 {
+-		return Range{}, fmt.Errorf("invalid sc-min-posts-interval-ms: must be greater than zero")
+ 	}
+ 	return r, nil
+ }
+@@ -329,6 +330,20 @@
+ 		return parseRange(fallback)
+ 	}
+ 	return parseRange(s)
++}
++
++// Compatibility fixes: https://github.com/getmikan/Citrus/pull/9
++// ParseRangeOrDefault is like ParseRange, but also uses fallback when the range is "0" or "0-0".
++// Xray-core treats a range with To == 0 as unset and applies its default in that case.
++func ParseRangeOrDefault(s string, fallback string) (Range, error) {
++	r, err := ParseRange(s, fallback)
++	if err != nil {
++		return Range{}, err
++	}
++	if r.Max == 0 {
++		return parseRange(fallback)
++	}
++	return r, nil
+ }
+ 
+ func parseRange(s string) (Range, error) {
+diff --git a/transport/xhttp/xpadding.go b/transport/xhttp/xpadding.go
+--- a/transport/xhttp/xpadding.go
++++ b/transport/xhttp/xpadding.go
+@@ -178,7 +178,8 @@
+ }
+ 
+ func (c *Config) GetNormalizedXPaddingBytes() (Range, error) {
+-	r, err := ParseRange(c.XPaddingBytes, "100-1000")
++	// "0-0" means the default like in Xray-core, the padding can't be disabled
++	r, err := ParseRangeOrDefault(c.XPaddingBytes, "100-1000")
+ 	if err != nil {
+ 		return Range{}, fmt.Errorf("invalid x-padding-bytes: %w", err)
+ 	}
+diff --git a/transport/xhttp/path_query_test.go b/transport/xhttp/path_query_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/xhttp/path_query_test.go
+@@ -0,0 +1,119 @@
++package xhttp
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++	"github.com/metacubex/http/httptrace"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++type captureRoundTripper chan *http.Request
++
++func (c captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	c <- req
++	if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.GotConn != nil {
++		conn, peer := net.Pipe()
++		trace.GotConn(httptrace.GotConnInfo{Conn: conn})
++		_ = conn.Close()
++		_ = peer.Close()
++	}
++	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
++}
++
++func TestClientPathWithQuery(t *testing.T) {
++	for _, mode := range []string{"stream-one", "stream-up", "packet-up"} {
++		t.Run(mode, func(t *testing.T) {
++			for _, variant := range []string{"no_query", "query", "download_query"} {
++				if mode == "stream-one" && variant == "download_query" {
++					continue
++				}
++				t.Run(variant, func(t *testing.T) {
++					requests := make(captureRoundTripper, 4)
++					cfg := &Config{Host: "xhttp.invalid", Path: "/xhttp", Mode: mode}
++					if variant != "no_query" {
++						cfg.Path += "?ed=2560&flag=x"
++					}
++					if variant == "download_query" {
++						cfg.DownloadConfig = &Config{Host: "download.invalid", Path: "/download?flag=down%2Fvalue&flag=second"}
++					}
++					client, err := NewClient(cfg, func() http.RoundTripper { return requests }, nil, false)
++					require.NoError(t, err)
++					defer client.Close()
++
++					conn, err := client.Dial(context.Background())
++					require.NoError(t, err)
++					defer conn.Close()
++
++					count := 2 // download and upload
++					switch mode {
++					case "stream-one":
++						count = 1
++					case "packet-up":
++						_, err = conn.Write([]byte("ping"))
++						require.NoError(t, err)
++					}
++					for i := 0; i < count; i++ {
++						select {
++						case req := <-requests:
++							path, query := "/xhttp/", ""
++							if variant != "no_query" {
++								query = "ed=2560&flag=x"
++							}
++							if variant == "download_query" && req.Method == http.MethodGet {
++								path, query = "/download/", "flag=down%2Fvalue&flag=second"
++							}
++							assert.Contains(t, req.URL.Path, path)
++							assert.NotContains(t, req.URL.Path, "?")
++							assert.Equal(t, query, req.URL.RawQuery)
++						case <-time.After(5 * time.Second):
++							t.Fatal("request not sent")
++						}
++					}
++				})
++			}
++		})
++	}
++}
++
++func TestNormalizedPathAndQuery(t *testing.T) {
++	for _, tc := range []struct{ input, path, query string }{
++		{"", "/", ""},
++		{"xhttp", "/xhttp/", ""},
++		{"/xhttp/", "/xhttp/", ""},
++		{"?ed=1", "/", "ed=1"},
++		{"/xhttp?", "/xhttp/", ""},
++		{"/xhttp?x=a?b", "/xhttp/", "x=a?b"},
++		{"/xhttp?x=a%2Fb&x=c", "/xhttp/", "x=a%2Fb&x=c"},
++	} {
++		t.Run(tc.input, func(t *testing.T) {
++			cfg := &Config{Path: tc.input}
++			assert.Equal(t, tc.path, cfg.NormalizedPath())
++			assert.Equal(t, tc.query, cfg.NormalizedQuery())
++		})
++	}
++}
++
++func TestServerPathWithQuery(t *testing.T) {
++	config := Config{Path: "/xhttp?ed=2560", Mode: "stream-one"}
++	handler, err := NewServerHandler(ServerOption{
++		Config: config,
++		ConnHandler: func(conn net.Conn) {
++			_ = conn.Close()
++		},
++	})
++	require.NoError(t, err)
++
++	req := httptest.NewRequest(http.MethodPost, "https://example.com/xhttp/?ed=2560", io.NopCloser(http.NoBody))
++	require.NoError(t, config.FillStreamRequest(req, ""))
++	recorder := httptest.NewRecorder()
++	handler.ServeHTTP(recorder, req)
++
++	assert.Equal(t, http.StatusOK, recorder.Result().StatusCode)
++}
+diff --git a/transport/xhttp/compatibility_test.go b/transport/xhttp/compatibility_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/xhttp/compatibility_test.go
+@@ -0,0 +1,91 @@
++package xhttp
++
++import (
++	"io"
++	"net"
++	"testing"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++	"github.com/stretchr/testify/require"
++)
++
++func TestXHTTPZeroRangesUseDefaults(t *testing.T) {
++	tests := []struct {
++		name string
++		read func(*Config) (Range, error)
++		want Range
++	}{
++		{"padding", (*Config).GetNormalizedXPaddingBytes, Range{100, 1000}},
++		{"stream_up_interval", (*Config).GetNormalizedScStreamUpServerSecs, Range{20, 80}},
++		{"buffered_posts", (*Config).GetNormalizedScMaxBufferedPosts, Range{30, 30}},
++		{"post_bytes", (*Config).GetNormalizedScMaxEachPostBytes, Range{1000000, 1000000}},
++		{"post_interval", (*Config).GetNormalizedScMinPostsIntervalMs, Range{30, 30}},
++	}
++	config := func(value string) *Config {
++		return &Config{XPaddingBytes: value, ScStreamUpServerSecs: value,
++			ScMaxBufferedPosts: value, ScMaxEachPostBytes: value, ScMinPostsIntervalMs: value}
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			for _, value := range []string{"", "0", "0-0"} {
++				got, err := tc.read(config(value))
++				require.NoError(t, err)
++				require.Equal(t, tc.want, got, value)
++			}
++			got, err := tc.read(config("2-4"))
++			require.NoError(t, err)
++			require.Equal(t, Range{2, 4}, got, "explicit ranges remain authoritative")
++			for _, value := range []string{"bad", "-1", "4-2"} {
++				_, err := tc.read(config(value))
++				require.Error(t, err, value)
++			}
++		})
++	}
++	_, err := (&Config{ScMaxEachPostBytes: "0-1024"}).GetNormalizedScMaxEachPostBytes()
++	require.Error(t, err, "a zero-sized upload block makes very little progress")
++}
++
++func TestXHTTPZeroPaddingAcceptedByServer(t *testing.T) {
++	for _, mode := range []string{"stream-one", "packet-up"} {
++		for _, serverPadding := range []string{"", "0", "0-0"} {
++			for _, clientPadding := range []string{"0", "0-0"} {
++				t.Run(mode+"/server="+serverPadding+"/client="+clientPadding, func(t *testing.T) {
++					serverConfig := Config{Path: "/xhttp", Mode: mode, XPaddingBytes: serverPadding}
++					handler, err := NewServerHandler(ServerOption{
++						Config:      serverConfig,
++						ConnHandler: func(conn net.Conn) { _ = conn.Close() },
++					})
++					require.NoError(t, err)
++					clientConfig := serverConfig
++					clientConfig.XPaddingBytes = clientPadding
++					method, target := http.MethodPost, "https://xhttp.invalid/xhttp/"
++					if mode == "packet-up" {
++						method, target = http.MethodGet, "https://xhttp.invalid/xhttp/session"
++					}
++					req := httptest.NewRequest(method, target, io.NopCloser(http.NoBody))
++					require.NoError(t, clientConfig.FillStreamRequest(req, ""))
++					recorder := httptest.NewRecorder()
++					handler.ServeHTTP(recorder, req)
++					require.Equal(t, http.StatusOK, recorder.Result().StatusCode)
++				})
++			}
++		}
++	}
++}
++
++func TestXHTTPReuseZeroKeepsItsMeaning(t *testing.T) {
++	for _, value := range []string{"0", "0-0"} {
++		config := &ReuseConfig{MaxConnections: value, MaxConcurrency: value,
++			CMaxReuseTimes: value, HMaxRequestTimes: value, HMaxReusableSecs: value}
++		concurrency, connections, err := config.ResolveManagerConfig()
++		require.NoError(t, err)
++		require.Equal(t, Range{}, concurrency)
++		require.Equal(t, Range{}, connections)
++		reuse, requests, seconds, err := config.ResolveEntryConfig()
++		require.NoError(t, err)
++		require.Equal(t, Range{}, reuse)
++		require.Equal(t, Range{}, requests)
++		require.Equal(t, Range{}, seconds)
++	}
++}
+diff --git a/common/convert/v.go b/common/convert/v.go
+--- a/common/convert/v.go
++++ b/common/convert/v.go
+@@ -168,21 +168,29 @@
+ 	return nil
+ }
+ 
++// Compatibility fixes: https://github.com/getmikan/Citrus/pull/9
++// xhttpRange converts an xray-core Int32Range JSON value, which is either a number or a "from-to" string,
++// to the mihomo range string.
++func xhttpRange(v any) (string, bool) {
++	switch val := v.(type) {
++	case string:
++		if val != "" {
++			return val, true
++		}
++	case float64:
++		return strconv.FormatInt(int64(val), 10), true
++	}
++	return "", false
++}
++
+ // parseXHTTPExtra maps xray-core extra JSON fields to mihomo xhttp-opts fields.
+ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
+ 	// xmuxToReuse converts an xmux map to mihomo reuse-settings.
+ 	xmuxToReuse := func(xmux map[string]any) map[string]any {
+ 		reuse := make(map[string]any)
+ 		set := func(src, dst string) {
+-			if v, ok := xmux[src]; ok {
+-				switch val := v.(type) {
+-				case string:
+-					if val != "" {
+-						reuse[dst] = val
+-					}
+-				case float64:
+-					reuse[dst] = strconv.FormatInt(int64(val), 10)
+-				}
++			if v, ok := xhttpRange(xmux[src]); ok {
++				reuse[dst] = v
+ 			}
+ 		}
+ 		set("maxConnections", "max-connections")
+@@ -204,7 +212,7 @@
+ 		opts["no-grpc-header"] = true
+ 	}
+ 
+-	if v, ok := extra["xPaddingBytes"].(string); ok && v != "" {
++	if v, ok := xhttpRange(extra["xPaddingBytes"]); ok {
+ 		opts["x-padding-bytes"] = v
+ 	}
+ 
+@@ -248,10 +256,8 @@
+ 		opts["session-table"] = v
+ 	}
+ 
+-	if v, ok := extra["sessionIDLength"].(string); ok && v != "" {
++	if v, ok := xhttpRange(extra["sessionIDLength"]); ok {
+ 		opts["session-length"] = v
+-	} else if v, ok := extra["sessionIDLength"].(float64); ok {
+-		opts["session-length"] = strconv.FormatInt(int64(v), 10)
+ 	}
+ 
+ 	if v, ok := extra["seqPlacement"].(string); ok && v != "" {
+@@ -270,16 +276,16 @@
+ 		opts["uplink-data-key"] = v
+ 	}
+ 
+-	if v, ok := extra["uplinkChunkSize"].(float64); ok {
+-		opts["uplink-chunk-size"] = int(v)
+-	}
+-
+-	if v, ok := extra["scMaxEachPostBytes"].(float64); ok {
+-		opts["sc-max-each-post-bytes"] = int(v)
+-	}
+-
+-	if v, ok := extra["scMinPostsIntervalMs"].(float64); ok {
+-		opts["sc-min-posts-interval-ms"] = int(v)
++	if v, ok := xhttpRange(extra["uplinkChunkSize"]); ok {
++		opts["uplink-chunk-size"] = v
++	}
++
++	if v, ok := xhttpRange(extra["scMaxEachPostBytes"]); ok {
++		opts["sc-max-each-post-bytes"] = v
++	}
++
++	if v, ok := xhttpRange(extra["scMinPostsIntervalMs"]); ok {
++		opts["sc-min-posts-interval-ms"] = v
+ 	}
+ 
+ 	// xmux in root extra → reuse-settings
+@@ -358,7 +364,13 @@
+ 				ds["headers"] = headers
+ 			}
+ 
+-			// xmux inside downloadSettings.xhttpSettings.extra → download-settings.reuse-settings
++			// xmux inside downloadSettings.xhttpSettings → download-settings.reuse-settings
++			if xmuxAny, ok := xhttpAny["xmux"].(map[string]any); ok && len(xmuxAny) > 0 {
++				if reuse := xmuxToReuse(xmuxAny); len(reuse) > 0 {
++					ds["reuse-settings"] = reuse
++				}
++			}
++			// xmux inside downloadSettings.xhttpSettings.extra takes precedence, like in xray-core
+ 			if dsExtraAny, ok := xhttpAny["extra"].(map[string]any); ok {
+ 				if xmuxAny, ok := dsExtraAny["xmux"].(map[string]any); ok && len(xmuxAny) > 0 {
+ 					if reuse := xmuxToReuse(xmuxAny); len(reuse) > 0 {
+diff --git a/common/convert/xhttp_extra_test.go b/common/convert/xhttp_extra_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/convert/xhttp_extra_test.go
+@@ -0,0 +1,103 @@
++package convert_test
++
++import (
++	"net/url"
++	"testing"
++
++	"github.com/metacubex/mihomo/adapter"
++	. "github.com/metacubex/mihomo/common/convert"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func convertXHTTPExtra(t *testing.T, extra string) map[string]any {
++	link := "vless://88888888-4444-4444-4444-121212121212@example.com:443?type=xhttp&security=tls&sni=example.com" +
++		"&path=" + url.QueryEscape("/xhttp?ed=2048") + "&mode=packet-up&extra=" + url.QueryEscape(extra) + "#xhttp"
++	proxies, err := ConvertsV2Ray([]byte(link))
++	require.NoError(t, err)
++	require.Len(t, proxies, 1)
++
++	_, err = adapter.ParseProxy(proxies[0])
++	require.NoError(t, err)
++
++	opts, ok := proxies[0]["xhttp-opts"].(map[string]any)
++	require.True(t, ok)
++	return opts
++}
++
++func TestConvertsV2RayXHTTPExtraRangesAsNumbers(t *testing.T) {
++	opts := convertXHTTPExtra(t, `{
++		"xPaddingBytes": 500,
++		"uplinkChunkSize": 4096,
++		"scMaxEachPostBytes": 1000000,
++		"scMinPostsIntervalMs": 30,
++		"sessionIDLength": 24,
++		"xmux": {"maxConcurrency": 16, "hMaxRequestTimes": 800, "hMaxReusableSecs": 2000, "hKeepAlivePeriod": 15}
++	}`)
++
++	assert.Equal(t, "/xhttp?ed=2048", opts["path"])
++	assert.Equal(t, "500", opts["x-padding-bytes"])
++	assert.Equal(t, "4096", opts["uplink-chunk-size"])
++	assert.Equal(t, "1000000", opts["sc-max-each-post-bytes"])
++	assert.Equal(t, "30", opts["sc-min-posts-interval-ms"])
++	assert.Equal(t, "24", opts["session-length"])
++	assert.Equal(t, map[string]any{
++		"max-concurrency":     "16",
++		"h-max-request-times": "800",
++		"h-max-reusable-secs": "2000",
++		"h-keep-alive-period": 15,
++	}, opts["reuse-settings"])
++}
++
++func TestConvertsV2RayXHTTPExtraRangesAsStrings(t *testing.T) {
++	opts := convertXHTTPExtra(t, `{
++		"xPaddingBytes": "100-1000",
++		"uplinkChunkSize": "2048-4096",
++		"scMaxEachPostBytes": "500000-1000000",
++		"scMinPostsIntervalMs": "10-50",
++		"sessionIDLength": "16-32",
++		"xmux": {"maxConnections": "2-4", "cMaxReuseTimes": "0", "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000"},
++		"downloadSettings": {
++			"address": "download.example.com",
++			"port": 8443,
++			"xhttpSettings": {
++				"path": "/down",
++				"xmux": {"maxConnections": 1},
++				"extra": {"xmux": {"maxConcurrency": "8-16"}}
++			}
++		}
++	}`)
++
++	assert.Equal(t, "100-1000", opts["x-padding-bytes"])
++	assert.Equal(t, "2048-4096", opts["uplink-chunk-size"])
++	assert.Equal(t, "500000-1000000", opts["sc-max-each-post-bytes"])
++	assert.Equal(t, "10-50", opts["sc-min-posts-interval-ms"])
++	assert.Equal(t, "16-32", opts["session-length"])
++	assert.Equal(t, map[string]any{
++		"max-connections":     "2-4",
++		"c-max-reuse-times":   "0",
++		"h-max-request-times": "600-900",
++		"h-max-reusable-secs": "1800-3000",
++	}, opts["reuse-settings"])
++
++	ds, ok := opts["download-settings"].(map[string]any)
++	require.True(t, ok)
++	assert.Equal(t, "/down", ds["path"])
++	assert.Equal(t, map[string]any{"max-concurrency": "8-16"}, ds["reuse-settings"]) // extra takes precedence
++}
++
++func TestConvertsV2RayXHTTPExtraZeroDefaults(t *testing.T) {
++	opts := convertXHTTPExtra(t, `{"xPaddingBytes":0,"scMaxEachPostBytes":0,"scMinPostsIntervalMs":0,"xmux":{"maxConnections":0}}`)
++	for _, key := range []string{"x-padding-bytes", "sc-max-each-post-bytes", "sc-min-posts-interval-ms"} {
++		assert.Equal(t, "0", opts[key], key)
++	}
++	assert.Equal(t, map[string]any{"max-connections": "0"}, opts["reuse-settings"])
++}
++
++func TestConvertsV2RayXHTTPDownloadXMux(t *testing.T) {
++	opts := convertXHTTPExtra(t, `{"downloadSettings":{"address":"download.invalid","port":8443,"xhttpSettings":{"path":"/down","xmux":{"maxConnections":2}}}}`)
++	ds, ok := opts["download-settings"].(map[string]any)
++	require.True(t, ok)
++	assert.Equal(t, map[string]any{"max-connections": "2"}, ds["reuse-settings"])
++}

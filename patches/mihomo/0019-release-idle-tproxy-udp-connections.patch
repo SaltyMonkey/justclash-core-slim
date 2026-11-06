@@ -1,0 +1,693 @@
+Release idle TPROXY UDP local sockets and stop their reader goroutines.
+Based on upstream PR #3344:
+https://github.com/MetaCubeX/mihomo/pull/3344
+
+Downstream hardening: atomically retire only the expected socket, invalidate
+closed cached sockets before one write retry, and publish before reading.
+Creation uses a held per-key mutex instead of a lossy condition notification;
+NAT-entry and creation-lock replacements are checked before publishing/cleanup.
+No socket I/O runs inside a map Compute callback.
+
+diff --git a/component/nat/table.go b/component/nat/table.go
+--- a/component/nat/table.go
++++ b/component/nat/table.go
+@@ -43,10 +43,17 @@
+ 	return item
+ }
+ 
+-func (t *Table) AddForLocalConn(lAddr, rAddr string, conn *net.UDPConn) bool {
++func (t *Table) AddForLocalConn(lAddr, rAddr string, conn *net.UDPConn, creationLock *sync.Cond) bool {
+ 	entry, exist := t.getEntry(lAddr)
+ 	if !exist {
+ 		return false
++	}
++	// A replaced NAT entry must not inherit a socket from its retired creator.
++	if creationLock != nil {
++		current, loaded := entry.LocalLockMap.Load(rAddr)
++		if !loaded || current != creationLock {
++			return false
++		}
+ 	}
+ 	entry.LocalUDPConnMap.Store(rAddr, conn)
+ 	return true
+@@ -60,6 +67,9 @@
+ 	entry.LocalUDPConnMap.Range(f)
+ }
+ 
++// GetOrCreateLockForLocalConn returns a per-key creation barrier.
++// The creator owns L on return; waiters lock L after the creator releases it.
++// Every creator exit must conditionally remove its barrier and unlock L.
+ func (t *Table) GetOrCreateLockForLocalConn(lAddr, key string) (*sync.Cond, bool) {
+ 	entry, loaded := t.getEntry(lAddr)
+ 	if !loaded {
+@@ -77,12 +87,31 @@
+ 	entry.LocalUDPConnMap.Delete(key)
+ }
+ 
+-func (t *Table) DeleteLockForLocalConn(lAddr, key string) {
++// DeleteForLocalConnIf removes only the expected socket, atomically with the check.
++func (t *Table) DeleteForLocalConnIf(lAddr, key string, expected *net.UDPConn) {
+ 	entry, loaded := t.getEntry(lAddr)
+ 	if !loaded {
+ 		return
+ 	}
+-	entry.LocalLockMap.Delete(key)
++	entry.LocalUDPConnMap.Compute(key, func(current *net.UDPConn, loaded bool) (*net.UDPConn, xsync.ComputeOp) {
++		if loaded && current == expected {
++			return nil, xsync.DeleteOp
++		}
++		return current, xsync.CancelOp
++	})
++}
++
++func (t *Table) DeleteLockForLocalConn(lAddr, key string, expected *sync.Cond) {
++	entry, loaded := t.getEntry(lAddr)
++	if !loaded {
++		return
++	}
++	entry.LocalLockMap.Compute(key, func(current *sync.Cond, loaded bool) (*sync.Cond, xsync.ComputeOp) {
++		if loaded && current == expected {
++			return nil, xsync.DeleteOp
++		}
++		return current, xsync.CancelOp
++	})
+ }
+ 
+ func (t *Table) getEntry(key string) (*entry, bool) {
+@@ -90,7 +119,10 @@
+ }
+ 
+ func makeLock() *sync.Cond {
+-	return sync.NewCond(&sync.Mutex{})
++	// Publish the creation lock already held: waiters cannot miss completion.
++	mutex := &sync.Mutex{}
++	mutex.Lock()
++	return sync.NewCond(mutex)
+ }
+ 
+ // New return *Cache
+diff --git a/component/nat/local_conn_test.go b/component/nat/local_conn_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/nat/local_conn_test.go
+@@ -0,0 +1,109 @@
++package nat
++
++import (
++	"net"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func localConnTestTable() *Table {
++	table := New()
++	table.GetOrCreate("local", func() C.PacketSender { return nil })
++	return table
++}
++
++func TestDeleteLocalConnIf(t *testing.T) {
++	table := localConnTestTable()
++	old, replacement := &net.UDPConn{}, &net.UDPConn{}
++	table.AddForLocalConn("local", "remote", old, nil)
++	table.DeleteForLocalConnIf("local", "remote", replacement)
++	if table.GetForLocalConn("local", "remote") != old {
++		t.Fatal("mismatched socket was removed")
++	}
++	table.DeleteForLocalConnIf("local", "remote", old)
++	if table.GetForLocalConn("local", "remote") != nil {
++		t.Fatal("matching socket remains cached")
++	}
++	table.DeleteForLocalConnIf("missing", "remote", old)
++	table.DeleteForLocalConnIf("local", "missing", old)
++}
++
++func TestLocalConnReplacementSurvivesCleanup(t *testing.T) {
++	table := localConnTestTable()
++	old, replacement := &net.UDPConn{}, &net.UDPConn{}
++	for i := 0; i < 2000; i++ {
++		table.AddForLocalConn("local", "remote", old, nil)
++		start, done := make(chan struct{}), make(chan struct{})
++		go func() {
++			defer close(done)
++			<-start
++			table.DeleteForLocalConnIf("local", "remote", old)
++		}()
++		close(start)
++		table.AddForLocalConn("local", "remote", replacement, nil)
++		<-done
++		if table.GetForLocalConn("local", "remote") != replacement {
++			t.Fatal("retired reader removed the replacement")
++		}
++	}
++}
++
++func TestLocalConnCreationGeneration(t *testing.T) {
++	table := localConnTestTable()
++	oldLock, _ := table.GetOrCreateLockForLocalConn("local", "remote")
++	defer oldLock.L.Unlock()
++	table.Delete("local")
++	table.GetOrCreate("local", func() C.PacketSender { return nil })
++	newLock, _ := table.GetOrCreateLockForLocalConn("local", "remote")
++	defer newLock.L.Unlock()
++	replacement := &net.UDPConn{}
++	if table.AddForLocalConn("local", "remote", &net.UDPConn{}, oldLock) {
++		t.Fatal("old creator published into a replacement NAT entry")
++	}
++	if !table.AddForLocalConn("local", "remote", replacement, newLock) {
++		t.Fatal("current creator could not publish")
++	}
++	table.DeleteLockForLocalConn("local", "remote", oldLock)
++	current, loaded := table.GetOrCreateLockForLocalConn("local", "remote")
++	if !loaded || current != newLock {
++		t.Fatal("old creator removed the new creation lock")
++	}
++	table.DeleteForLocalConnIf("local", "remote", &net.UDPConn{})
++	if table.GetForLocalConn("local", "remote") != replacement {
++		t.Fatal("replacement NAT entry lost its socket")
++	}
++}
++
++func TestLocalConnCreationLockIsPublishedHeld(t *testing.T) {
++	table := localConnTestTable()
++	lock, loaded := table.GetOrCreateLockForLocalConn("local", "remote")
++	if loaded {
++		t.Fatal("unexpected existing creation lock")
++	}
++	other, loaded := table.GetOrCreateLockForLocalConn("local", "remote")
++	if !loaded || other != lock {
++		t.Fatal("waiter did not share the creator's lock")
++	}
++	started, acquired := make(chan struct{}), make(chan struct{})
++	go func() {
++		close(started)
++		other.L.Lock()
++		close(acquired)
++		other.L.Unlock()
++	}()
++	<-started
++	select {
++	case <-acquired:
++		t.Fatal("waiter passed an unfinished creator")
++	case <-time.After(20 * time.Millisecond):
++	}
++	table.DeleteLockForLocalConn("local", "remote", lock)
++	lock.L.Unlock()
++	select {
++	case <-acquired:
++	case <-time.After(2 * time.Second):
++		t.Fatal("waiter was not released")
++	}
++}
+diff --git a/constant/adapters.go b/constant/adapters.go
+--- a/constant/adapters.go
++++ b/constant/adapters.go
+@@ -345,7 +345,7 @@
+ 
+ 	GetForLocalConn(lAddr, rAddr string) *net.UDPConn
+ 
+-	AddForLocalConn(lAddr, rAddr string, conn *net.UDPConn) bool
++	AddForLocalConn(lAddr, rAddr string, conn *net.UDPConn, creationLock *sync.Cond) bool
+ 
+ 	RangeForLocalConn(lAddr string, f func(key string, value *net.UDPConn) bool)
+ 
+@@ -353,5 +353,7 @@
+ 
+ 	DeleteForLocalConn(lAddr, key string)
+ 
+-	DeleteLockForLocalConn(lAddr, key string)
+-}
++	DeleteForLocalConnIf(lAddr, key string, expected *net.UDPConn)
++
++	DeleteLockForLocalConn(lAddr, key string, expected *sync.Cond)
++}
+diff --git a/listener/tproxy/packet.go b/listener/tproxy/packet.go
+--- a/listener/tproxy/packet.go
++++ b/listener/tproxy/packet.go
+@@ -5,6 +5,7 @@
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
++	"time"
+ 
+ 	"github.com/metacubex/mihomo/adapter/inbound"
+ 	"github.com/metacubex/mihomo/common/pool"
+@@ -32,6 +33,18 @@
+ 		return
+ 	}
+ 	n, err = tc.Write(b)
++	if errors.Is(err, net.ErrClosed) {
++		// Forget the closed socket before asking the cache for a fresh one.
++		c.tunnel.NatTable().DeleteForLocalConnIf(c.lAddr.String(), rAddr.String(), tc)
++		tc, err = createOrGetLocalConn(rAddr, c.lAddr, c.tunnel, c.additions...)
++		if err != nil {
++			return
++		}
++		n, err = tc.Write(b)
++	}
++	if err == nil {
++		_ = tc.SetReadDeadline(time.Now().Add(localConnIdleTimeout))
++	}
+ 	return
+ }
+ 
+@@ -60,58 +73,66 @@
+ 	// localConn not exist
+ 	if localConn == nil {
+ 		cond, loaded := natTable.GetOrCreateLockForLocalConn(local, remote)
++		if cond == nil {
++			return nil, fmt.Errorf("cond is nil, nat entry not exist")
++		}
+ 		if loaded {
++			// The creator publishes a held mutex and releases it on success or error.
++			// No Cond.Wait means no missed broadcast and no stranded waiter.
+ 			cond.L.Lock()
+-			cond.Wait()
+-			// we should get localConn here
+ 			localConn = natTable.GetForLocalConn(local, remote)
++			cond.L.Unlock()
+ 			if localConn == nil {
+ 				return nil, fmt.Errorf("localConn is nil, nat entry not exist")
+ 			}
+-			cond.L.Unlock()
+ 		} else {
+-			if cond == nil {
+-				return nil, fmt.Errorf("cond is nil, nat entry not exist")
++			defer func() {
++				natTable.DeleteLockForLocalConn(local, remote, cond)
++				cond.L.Unlock()
++			}()
++			// Another creator may have published a socket before this lock was made.
++			if localConn = natTable.GetForLocalConn(local, remote); localConn != nil {
++				return localConn, nil
+ 			}
+-			defer func() {
+-				natTable.DeleteLockForLocalConn(local, remote)
+-				cond.Broadcast()
+-			}()
+-			conn, err := listenLocalConn(rAddr, lAddr, tunnel, additions...)
++			conn, err := dialUDP("udp", rAddr, lAddr)
+ 			if err != nil {
+ 				log.Errorln("listenLocalConn failed with error: %s, packet loss (rAddr[%T]=%s lAddr[%T]=%s)", err.Error(), rAddr, remote, lAddr, local)
+ 				return nil, err
+ 			}
+-			natTable.AddForLocalConn(local, remote, conn)
++			if !natTable.AddForLocalConn(local, remote, conn, cond) {
++				_ = conn.Close()
++				return nil, fmt.Errorf("nat entry changed while creating local conn")
++			}
+ 			localConn = conn
++			// Publish first; an immediate read error must not leave a closed socket cached.
++			go serveLocalConn(conn, rAddr, lAddr, tunnel, localConnIdleTimeout, additions...)
+ 		}
+ 	}
+ 	return localConn, nil
+ }
+ 
+-// this function listen at rAddr
+-// and send what received to program itself, then send to real remote
+-func listenLocalConn(rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, additions ...inbound.Addition) (*net.UDPConn, error) {
+-	lc, err := dialUDP("udp", rAddr, lAddr)
+-	if err != nil {
+-		return nil, err
++// Based on https://github.com/MetaCubeX/mihomo/pull/3344.
++// Match the tunnel's UDP NAT idle timeout; active reads and replies refresh it.
++const localConnIdleTimeout = 60 * time.Second
++
++func serveLocalConn(lc *net.UDPConn, rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, idle time.Duration, additions ...inbound.Addition) {
++	log.Debugln("TProxy listenLocalConn rAddr=%s lAddr=%s", rAddr, lAddr)
++	defer func() {
++		_ = lc.Close()
++		// An old reader gets to retire its socket, not evict the new tenant.
++		tunnel.NatTable().DeleteForLocalConnIf(lAddr.String(), rAddr.String(), lc)
++		log.Debugln("TProxy local conn listener exit.. rAddr=%s lAddr=%s", rAddr, lAddr)
++	}()
++	for {
++		if err := lc.SetReadDeadline(time.Now().Add(idle)); err != nil {
++			return
++		}
++		buf := pool.Get(pool.UDPBufferSize)
++		br, err := lc.Read(buf)
++		if err != nil {
++			pool.Put(buf)
++			return
++		}
++		handlePacketConn(lc, tunnel, buf[:br], lAddr, rAddr, additions...)
+ 	}
+-	go func() {
+-		log.Debugln("TProxy listenLocalConn rAddr=%s lAddr=%s", rAddr, lAddr)
+-		for {
+-			buf := pool.Get(pool.UDPBufferSize)
+-			br, err := lc.Read(buf)
+-			if err != nil {
+-				if errors.Is(err, net.ErrClosed) {
+-					log.Debugln("TProxy local conn listener exit.. rAddr=%s lAddr=%s", rAddr, lAddr)
+-					pool.Put(buf)
+-					return
+-				}
+-			}
+-			// since following localPackets are pass through this socket which listen rAddr
+-			// I choose current listener as packet's packet conn
+-			handlePacketConn(lc, tunnel, buf[:br], lAddr, rAddr, additions...)
+-		}
+-	}()
+-	return lc, nil
+ }
+diff --git a/listener/tproxy/packet_test.go b/listener/tproxy/packet_test.go
+new file mode 100644
+--- /dev/null
++++ b/listener/tproxy/packet_test.go
+@@ -0,0 +1,332 @@
++package tproxy
++
++import (
++	"bytes"
++	"errors"
++	"net"
++	"net/netip"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/nat"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type idleTestTunnel struct {
++	C.Tunnel
++	table   C.NatTable
++	packets chan []byte
++}
++
++func (t *idleTestTunnel) NatTable() C.NatTable { return t.table }
++func (t *idleTestTunnel) HandleUDPPacket(packet C.UDPPacket, _ *C.Metadata) {
++	data := append([]byte(nil), packet.Data()...)
++	packet.Drop()
++	t.packets <- data
++}
++
++func idleTestPair(t *testing.T) (*net.UDPConn, *net.UDPConn) {
++	t.Helper()
++	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal("could not create test peer")
++	}
++	t.Cleanup(func() { peer.Close() })
++	conn, err := net.DialUDP("udp4", nil, peer.LocalAddr().(*net.UDPAddr))
++	if err != nil {
++		t.Fatal("could not create test connection")
++	}
++	t.Cleanup(func() { conn.Close() })
++	return conn, peer
++}
++func idleTestState(t *testing.T, conn *net.UDPConn) (*nat.Table, *idleTestTunnel, netip.AddrPort, netip.AddrPort) {
++	t.Helper()
++	local := conn.LocalAddr().(*net.UDPAddr).AddrPort()
++	remote := conn.RemoteAddr().(*net.UDPAddr).AddrPort()
++	table := nat.New()
++	table.GetOrCreate(local.String(), func() C.PacketSender { return nil })
++	table.AddForLocalConn(local.String(), remote.String(), conn, nil)
++	tunnel := &idleTestTunnel{table: table, packets: make(chan []byte, 8)}
++	return table, tunnel, local, remote
++}
++func idleTestStart(t *testing.T, conn *net.UDPConn, tunnel C.Tunnel, local, remote netip.AddrPort, idle time.Duration) <-chan struct{} {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		serveLocalConn(conn, remote, local, tunnel, idle)
++	}()
++	t.Cleanup(func() { conn.Close(); idleTestWait(t, done) })
++	return done
++}
++func idleTestWait(t *testing.T, done <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("local reader did not finish")
++	}
++}
++func idleTestStillRunning(t *testing.T, done <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-done:
++		t.Fatal("an active local reader expired")
++	default:
++	}
++}
++
++func TestServeLocalConnIdleExit(t *testing.T) {
++	conn, _ := idleTestPair(t)
++	table, tunnel, local, remote := idleTestState(t, conn)
++	done := idleTestStart(t, conn, tunnel, local, remote, 30*time.Millisecond)
++	idleTestWait(t, done)
++	if table.GetForLocalConn(local.String(), remote.String()) != nil {
++		t.Fatal("idle socket remains cached")
++	}
++	if _, err := conn.Write([]byte("closed")); !errors.Is(err, net.ErrClosed) {
++		t.Fatal("idle socket remains open")
++	}
++	select {
++	case <-tunnel.packets:
++		t.Fatal("read failure was forwarded as a packet")
++	default:
++	}
++}
++
++func TestServeLocalConnClosedExit(t *testing.T) {
++	conn, _ := idleTestPair(t)
++	table, tunnel, local, remote := idleTestState(t, conn)
++	done := idleTestStart(t, conn, tunnel, local, remote, time.Second)
++	conn.Close()
++	idleTestWait(t, done)
++	if table.GetForLocalConn(local.String(), remote.String()) != nil {
++		t.Fatal("externally closed socket remains cached")
++	}
++}
++
++func TestServeLocalConnPreservesReplacement(t *testing.T) {
++	conn, _ := idleTestPair(t)
++	replacement, _ := idleTestPair(t)
++	table, tunnel, local, remote := idleTestState(t, conn)
++	done := idleTestStart(t, conn, tunnel, local, remote, time.Second)
++	table.AddForLocalConn(local.String(), remote.String(), replacement, nil)
++	conn.Close()
++	idleTestWait(t, done)
++	if table.GetForLocalConn(local.String(), remote.String()) != replacement {
++		t.Fatal("old reader removed the replacement")
++	}
++	if _, err := replacement.Write([]byte("alive")); err != nil {
++		t.Fatal("old reader closed the replacement")
++	}
++}
++
++func TestServeLocalConnReadRefreshesIdle(t *testing.T) {
++	conn, peer := idleTestPair(t)
++	_, tunnel, local, remote := idleTestState(t, conn)
++	done := idleTestStart(t, conn, tunnel, local, remote, 300*time.Millisecond)
++	time.Sleep(180 * time.Millisecond)
++	payload := []byte("activity")
++	if _, err := peer.WriteToUDP(payload, conn.LocalAddr().(*net.UDPAddr)); err != nil {
++		t.Fatal("could not send test packet")
++	}
++	select {
++	case got := <-tunnel.packets:
++		if !bytes.Equal(got, payload) {
++			t.Fatal("received packet changed")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("reader did not forward the packet")
++	}
++	time.Sleep(180 * time.Millisecond)
++	idleTestStillRunning(t, done)
++}
++
++func TestWriteBackRefreshesIdle(t *testing.T) {
++	conn, peer := idleTestPair(t)
++	_, tunnel, local, remote := idleTestState(t, conn)
++	done := idleTestStart(t, conn, tunnel, local, remote, 300*time.Millisecond)
++	time.Sleep(180 * time.Millisecond)
++	packet := &packet{lAddr: local, tunnel: tunnel}
++	payload := []byte("reply")
++	n, err := packet.WriteBack(payload, net.UDPAddrFromAddrPort(remote))
++	if err != nil || n != len(payload) {
++		t.Fatal("writeback failed")
++	}
++	peer.SetReadDeadline(time.Now().Add(time.Second))
++	buf := make([]byte, 32)
++	n, _, err = peer.ReadFromUDP(buf)
++	if err != nil || !bytes.Equal(buf[:n], payload) {
++		t.Fatal("reply did not reach the peer")
++	}
++	time.Sleep(180 * time.Millisecond)
++	idleTestStillRunning(t, done)
++}
++
++type replaceOnDeleteTable struct {
++	C.NatTable
++	old, replacement *net.UDPConn
++	before           bool
++	calls            int
++}
++
++func (t *replaceOnDeleteTable) DeleteForLocalConnIf(local, remote string, expected *net.UDPConn) {
++	t.calls++
++	if expected != t.old {
++		panic("writeback tried to remove a different socket")
++	}
++	if t.before {
++		t.NatTable.AddForLocalConn(local, remote, t.replacement, nil)
++	}
++	t.NatTable.DeleteForLocalConnIf(local, remote, expected)
++	if !t.before {
++		t.NatTable.AddForLocalConn(local, remote, t.replacement, nil)
++	}
++}
++
++func TestWriteBackRecreatesClosedCachedConn(t *testing.T) {
++	for _, before := range []bool{false, true} {
++		t.Run(map[bool]string{false: "after-delete", true: "concurrent-replacement"}[before], func(t *testing.T) {
++			old, _ := idleTestPair(t)
++			fresh, peer := idleTestPair(t)
++			table, tunnel, local, remote := idleTestState(t, fresh)
++			table.AddForLocalConn(local.String(), remote.String(), old, nil)
++			old.Close()
++			replacementTable := &replaceOnDeleteTable{NatTable: table, old: old, replacement: fresh, before: before}
++			tunnel.table = replacementTable
++			packet := &packet{lAddr: local, tunnel: tunnel}
++			payload := []byte("recreated")
++			n, err := packet.WriteBack(payload, net.UDPAddrFromAddrPort(remote))
++			if err != nil || n != len(payload) || replacementTable.calls != 1 {
++				t.Fatal("closed cached socket was not replaced once")
++			}
++			peer.SetReadDeadline(time.Now().Add(time.Second))
++			buf := make([]byte, 32)
++			n, _, err = peer.ReadFromUDP(buf)
++			if err != nil || !bytes.Equal(buf[:n], payload) {
++				t.Fatal("retry did not use the replacement")
++			}
++			if table.GetForLocalConn(local.String(), remote.String()) != fresh {
++				t.Fatal("replacement was evicted")
++			}
++		})
++	}
++}
++
++func TestWriteBackRetriesClosedConnOnlyOnce(t *testing.T) {
++	old, _ := idleTestPair(t)
++	fresh, _ := idleTestPair(t)
++	table, tunnel, local, remote := idleTestState(t, fresh)
++	table.AddForLocalConn(local.String(), remote.String(), old, nil)
++	old.Close()
++	fresh.Close()
++	replacementTable := &replaceOnDeleteTable{NatTable: table, old: old, replacement: fresh}
++	tunnel.table = replacementTable
++	packet := &packet{lAddr: local, tunnel: tunnel}
++	_, err := packet.WriteBack([]byte("retry"), net.UDPAddrFromAddrPort(remote))
++	if !errors.Is(err, net.ErrClosed) || replacementTable.calls != 1 {
++		t.Fatal("closed socket retry was not bounded")
++	}
++}
++
++type observedLockTable struct {
++	C.NatTable
++	observed chan struct{}
++	release  <-chan struct{}
++	once     sync.Once
++}
++
++func (t *observedLockTable) GetOrCreateLockForLocalConn(local, remote string) (*sync.Cond, bool) {
++	lock, loaded := t.NatTable.GetOrCreateLockForLocalConn(local, remote)
++	t.once.Do(func() { close(t.observed) })
++	if t.release != nil {
++		<-t.release
++	}
++	return lock, loaded
++}
++
++func TestLocalConnWaiterCompletesAfterCreator(t *testing.T) {
++	for _, success := range []bool{false, true} {
++		for _, late := range []bool{false, true} {
++			name := map[bool]string{false: "failure", true: "success"}[success] + "/" + map[bool]string{false: "waiting", true: "already-finished"}[late]
++			t.Run(name, func(t *testing.T) {
++				conn, _ := idleTestPair(t)
++				table, tunnel, local, remote := idleTestState(t, conn)
++				table.DeleteForLocalConnIf(local.String(), remote.String(), conn)
++				lock, _ := table.GetOrCreateLockForLocalConn(local.String(), remote.String())
++				observed := &observedLockTable{NatTable: table, observed: make(chan struct{})}
++				release := make(chan struct{})
++				if late {
++					observed.release = release
++				}
++				tunnel.table = observed
++				done := make(chan struct{})
++				var got *net.UDPConn
++				var err error
++				go func() { defer close(done); got, err = createOrGetLocalConn(remote, local, tunnel) }()
++				select {
++				case <-observed.observed:
++				case <-time.After(time.Second):
++					lock.L.Unlock()
++					if late {
++						close(release)
++					}
++					t.Fatal("waiter did not look up the creation lock")
++				}
++				if success && !table.AddForLocalConn(local.String(), remote.String(), conn, lock) {
++					lock.L.Unlock()
++					if late {
++						close(release)
++					}
++					t.Fatal("creator could not publish")
++				}
++				table.DeleteLockForLocalConn(local.String(), remote.String(), lock)
++				lock.L.Unlock()
++				if late {
++					close(release)
++				}
++				idleTestWait(t, done)
++				if success && (got != conn || err != nil) {
++					t.Fatal("waiter did not receive the published socket")
++				}
++				if !success && (got != nil || err == nil) {
++					t.Fatal("waiter did not receive the creation failure")
++				}
++			})
++		}
++	}
++}
++
++func TestServeLocalConnPreservesReplacementNATEntry(t *testing.T) {
++	conn, _ := idleTestPair(t)
++	replacement, _ := idleTestPair(t)
++	table, tunnel, local, remote := idleTestState(t, conn)
++	done := idleTestStart(t, conn, tunnel, local, remote, time.Second)
++	table.Delete(local.String())
++	table.GetOrCreate(local.String(), func() C.PacketSender { return nil })
++	table.AddForLocalConn(local.String(), remote.String(), replacement, nil)
++	conn.Close()
++	idleTestWait(t, done)
++	if table.GetForLocalConn(local.String(), remote.String()) != replacement {
++		t.Fatal("retired flow removed the replacement NAT entry's socket")
++	}
++}
++
++func TestWriteBackDoesNotRetryOtherErrors(t *testing.T) {
++	fresh, _ := idleTestPair(t)
++	table, tunnel, local, remote := idleTestState(t, fresh)
++	unconnected, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal("could not create unconnected socket")
++	}
++	defer unconnected.Close()
++	table.AddForLocalConn(local.String(), remote.String(), unconnected, nil)
++	observed := &replaceOnDeleteTable{NatTable: table, old: unconnected, replacement: fresh}
++	tunnel.table = observed
++	packet := &packet{lAddr: local, tunnel: tunnel}
++	_, err = packet.WriteBack([]byte("error"), net.UDPAddrFromAddrPort(remote))
++	if err == nil || errors.Is(err, net.ErrClosed) || observed.calls != 0 {
++		t.Fatal("an unrelated write failure triggered recreation")
++	}
++}

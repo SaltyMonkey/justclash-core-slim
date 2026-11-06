@@ -1,0 +1,166 @@
+Exclude BundleMRS.7z extraction from slim builds with no_rule_bundle.
+Upstream implementation:
+https://github.com/MetaCubeX/mihomo/blob/Alpha/rules/bundle/bundle.go
+
+Gate the original sevenzip reader behind !no_rule_bundle. The disabled build
+retains the bundle API and reports an explicit error for configured bundle
+paths, allowing the provider fetcher to continue with its ordinary source.
+Empty bundle paths stay disabled. The original implementation remains available
+without the exclusion tag; no module metadata changes are required.
+
+Tests use synthetic provider data to cover a valid local cache, an invalid
+local cache and a missing cache with a successful remote-source fallback.
+The following 0015 patch enables no_rule_bundle in the common slim tag list.
+
+diff --git a/rules/bundle/bundle.go b/rules/bundle/bundle.go
+--- a/rules/bundle/bundle.go
++++ b/rules/bundle/bundle.go
+@@ -1,3 +1,5 @@
++//go:build !no_rule_bundle
++
+ package bundle
+ 
+ import (
+diff --git a/rules/bundle/bundle_stub.go b/rules/bundle/bundle_stub.go
+new file mode 100644
+--- /dev/null
++++ b/rules/bundle/bundle_stub.go
+@@ -0,0 +1,22 @@
++//go:build no_rule_bundle
++
++package bundle
++
++import (
++	"errors"
++	"io/fs"
++
++	"github.com/metacubex/mihomo/component/resource"
++)
++
++var errBundleDisabled = errors.New("rule bundle support is disabled in this build")
++
++func MakeBundleFile(path string) resource.BundleFile {
++	if path == "" {
++		return nil
++	}
++	// Keep the ordinary provider fallback; a 7z reader need not come along.
++	return func() (fs.File, error) { return Open(path) }
++}
++
++func Open(string) (fs.File, error) { return nil, errBundleDisabled }
+diff --git a/rules/bundle/bundle_stub_test.go b/rules/bundle/bundle_stub_test.go
+new file mode 100644
+--- /dev/null
++++ b/rules/bundle/bundle_stub_test.go
+@@ -0,0 +1,26 @@
++//go:build no_rule_bundle
++
++package bundle
++
++import (
++	"errors"
++	"testing"
++)
++
++func TestDisabledRuleBundle(t *testing.T) {
++	if MakeBundleFile("") != nil {
++		t.Fatal("empty bundle path must remain disabled")
++	}
++	open := MakeBundleFile("synthetic-rules.mrs")
++	if open == nil {
++		t.Fatal("configured bundle path must report its disabled status")
++	}
++	file, err := open()
++	if file != nil || !errors.Is(err, errBundleDisabled) {
++		t.Fatal("bundle callback did not report disabled support")
++	}
++	file, err = Open("synthetic-rules.mrs")
++	if file != nil || !errors.Is(err, errBundleDisabled) {
++		t.Fatal("Open did not report disabled support")
++	}
++}
+diff --git a/component/resource/fetcher_bundle_disabled_test.go b/component/resource/fetcher_bundle_disabled_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/resource/fetcher_bundle_disabled_test.go
+@@ -0,0 +1,80 @@
++//go:build no_rule_bundle
++
++package resource_test
++
++import (
++	"context"
++	"errors"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/metacubex/mihomo/common/utils"
++	"github.com/metacubex/mihomo/component/resource"
++	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/metacubex/mihomo/rules/bundle"
++)
++
++type disabledBundleVehicle struct {
++	P.Vehicle
++	path          string
++	reads, writes int
++}
++
++func (v *disabledBundleVehicle) Path() string      { return v.path }
++func (*disabledBundleVehicle) Type() P.VehicleType { return P.HTTP }
++func (v *disabledBundleVehicle) Read(context.Context, utils.HashType) ([]byte, utils.HashType, error) {
++	v.reads++
++	payload := []byte("synthetic fetched rules")
++	return payload, utils.MakeHash(payload), nil
++}
++func (v *disabledBundleVehicle) Write(payload []byte) error {
++	v.writes++
++	return os.WriteFile(v.path, payload, 0600)
++}
++
++func TestDisabledBundlePreservesProviderSources(t *testing.T) {
++	for _, state := range []string{"valid_local", "invalid_local", "missing_local"} {
++		t.Run(state, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "synthetic-rules")
++			if state != "missing_local" {
++				payload := "synthetic local rules"
++				if state == "invalid_local" {
++					payload = "invalid local rules"
++				}
++				if err := os.WriteFile(path, []byte(payload), 0600); err != nil {
++					t.Fatal(err)
++				}
++			}
++			vehicle := &disabledBundleVehicle{path: path}
++			openBundle := bundle.MakeBundleFile("synthetic-rules.mrs")
++			calls := 0
++			fetcher := resource.NewFetcher("synthetic", 0, vehicle, func() (fs.File, error) {
++				calls++
++				return openBundle()
++			}, func(payload []byte) (string, error) {
++				if string(payload) == "invalid local rules" {
++					return "", errors.New("synthetic parse failure")
++				}
++				return string(payload), nil
++			}, nil)
++			defer fetcher.Close()
++			got, err := fetcher.Initial()
++			if err != nil {
++				t.Fatal(err)
++			}
++			want, bundleCalls, reads, writes := "synthetic fetched rules", 1, 1, 1
++			if state == "valid_local" {
++				want, bundleCalls, reads, writes = "synthetic local rules", 0, 0, 0
++			}
++			if got != want || calls != bundleCalls || vehicle.reads != reads || vehicle.writes != writes {
++				t.Fatalf("source selection: bundle=%d reads=%d writes=%d", calls, vehicle.reads, vehicle.writes)
++			}
++			cached, err := os.ReadFile(path)
++			if err != nil || string(cached) != want {
++				t.Fatal("provider cache contents were not preserved")
++			}
++		})
++	}
++}

@@ -5,22 +5,23 @@ diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
    
  env:
    REGISTRY: docker.io
-+  SLIM_TAGS: no_easytier,no_tailscale,no_zerotier,no_trusttunnel,no_hysteria1,no_shadowquic,no_openvpn,no_shadowsocksr,no_debug_http
++  SLIM_TAGS: no_easytier,no_tailscale,no_zerotier,no_trusttunnel,no_hysteria1,no_shadowquic,no_openvpn,no_shadowsocksr,no_debug_http,no_rule_bundle
  jobs:
    build:
      runs-on: ubuntu-latest
-@@ -222,9 +223,7 @@
+@@ -222,9 +223,8 @@
        run: |
          export SKIP_CONCURRENT_TEST=1
          export SKIP_INTEROP_TEST=1
 -        go test ./...
 -        echo "---test with_gvisor---"
 -        go test ./... -tags "with_gvisor" -count=1
++        go test github.com/metacubex/http/downstreamtests -count=1
 +        go test ./... -tags "${SLIM_TAGS}" -count=1
  
      - name: Update CA
        run: |
-@@ -242,7 +241,7 @@
+@@ -242,7 +242,7 @@
          GOMIPS: ${{matrix.jobs.gomips}}
        run: |
          go env

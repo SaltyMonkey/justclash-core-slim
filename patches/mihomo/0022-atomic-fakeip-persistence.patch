@@ -1,0 +1,1207 @@
+Persist fake-IP mappings and allocation state in one synchronous transaction.
+Downstream change based on upstream mihomo:
+https://github.com/MetaCubeX/mihomo/blob/Alpha/component/fakeip/pool.go
+https://github.com/MetaCubeX/mihomo/blob/Alpha/component/profile/cachefile/fakeip.go
+
+Allocate from the committed database cursor, replace both mapping directions,
+remove the previous address owner and save the offset/wrap marker in one Update.
+This avoids the default Batch delay while retaining synchronous persistence.
+
+Read both state fields from one snapshot. Preserve caches without a shutdown
+checkpoint and skip their occupied addresses on the first new allocation.
+Shutdown no longer writes a stale local cursor over another resolver's progress.
+The bucket names, mapping layout and state keys remain compatible with old cores.
+
+Tests cover rollback, atomic reader snapshots, IPv4/IPv6, legacy checkpoints,
+reload with overlapping resolvers, and restart after killing a child process.
+Includes standalone before/after benchmarks using synthetic temporary databases.
+Includes a 500-record correctness test and 500-record benchmark fixtures.
+Performance and restart audit: benchmarks/fakeip-atomic-write.md.
+500-record follow-up: benchmarks/fakeip-500.md.
+
+diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
+--- a/component/fakeip/pool.go
++++ b/component/fakeip/pool.go
+@@ -12,8 +12,8 @@
+ )
+ 
+ const (
+-	offsetKey = "key-offset-fake-ip"
+-	cycleKey  = "key-cycle-fake-ip"
++	offsetKey = cachefile.FakeIPOffsetKey
++	cycleKey  = cachefile.FakeIPCycleKey
+ )
+ 
+ type store interface {
+@@ -50,9 +50,7 @@
+ 		return ip
+ 	}
+ 
+-	ip := p.get(host)
+-	p.store.PutByHost(host, ip)
+-	return ip
++	return p.get(host)
+ }
+ 
+ // LookBack return host with the fake ip
+@@ -110,11 +108,22 @@
+ 		p.offset = p.first
+ 	}
+ 
++	if s, ok := p.store.(*cachefileStore); ok {
++		address, offset, cycle, err := s.Allocate(host, p.first, p.last)
++		if err == nil {
++			p.offset, p.cycle = offset, cycle
++			return address
++		}
++		// Keep the existing best-effort behavior when the cache cannot be written.
++		return p.offset
++	}
++
+ 	if p.cycle || p.store.Exist(p.offset) {
+ 		p.store.DelByIP(p.offset)
+ 	}
+ 
+ 	p.store.PutByIP(p.offset, host)
++	p.store.PutByHost(host, p.offset)
+ 	return p.offset
+ }
+ 
+@@ -127,30 +136,22 @@
+ 	return err
+ }
+ 
+-func (p *Pool) StoreState() {
+-	if s, ok := p.store.(*cachefileStore); ok {
+-		s.PutByHost(offsetKey, p.offset)
+-		if p.cycle {
+-			s.PutByHost(cycleKey, p.offset)
+-		}
+-	}
+-}
++// StoreState is retained for shutdown callers. Persistent allocation now commits
++// its cursor and cycle marker with every mapping, so no checkpoint is left to save.
++func (p *Pool) StoreState() {}
+ 
+ func (p *Pool) restoreState() {
+ 	if s, ok := p.store.(*cachefileStore); ok {
+-		if _, exist := s.GetByHost(cycleKey); exist {
+-			p.cycle = true
+-		}
+-
+-		if offset, exist := s.GetByHost(offsetKey); exist {
++		offset, cycle := s.State()
++		if offset.IsValid() {
+ 			if p.ipnet.Contains(offset) {
+-				p.offset = offset
++				p.offset, p.cycle = offset, cycle
+ 			} else {
+ 				_ = p.FlushFakeIP()
+ 			}
+-		} else if s.Exist(p.first) {
+-			_ = p.FlushFakeIP()
+ 		}
++		// No checkpoint is not a request to erase the records. Allocate skips occupied
++		// addresses and commits the recovered position with the first new mapping.
+ 	}
+ }
+ 
+diff --git a/component/fakeip/cachefile.go b/component/fakeip/cachefile.go
+--- a/component/fakeip/cachefile.go
++++ b/component/fakeip/cachefile.go
+@@ -8,6 +8,15 @@
+ 
+ type cachefileStore struct {
+ 	cache *cachefile.FakeIpStore
++}
++
++// Allocate uses the database cursor, shared by resolvers during a reload.
++func (c *cachefileStore) Allocate(host string, first, last netip.Addr) (netip.Addr, netip.Addr, bool, error) {
++	return c.cache.Allocate(host, first, last)
++}
++
++func (c *cachefileStore) State() (netip.Addr, bool) {
++	return c.cache.State()
+ }
+ 
+ // GetByHost implements store.GetByHost
+diff --git a/component/profile/cachefile/fakeip.go b/component/profile/cachefile/fakeip.go
+--- a/component/profile/cachefile/fakeip.go
++++ b/component/profile/cachefile/fakeip.go
+@@ -1,6 +1,8 @@
+ package cachefile
+ 
+ import (
++	"bytes"
++	"errors"
+ 	"net/netip"
+ 
+ 	"github.com/metacubex/mihomo/log"
+@@ -33,6 +35,112 @@
+ 		}
+ 		return nil
+ 	})
++	return
++}
++
++const (
++	// Keep the existing on-disk keys so older cores can still read the cache.
++	FakeIPOffsetKey = "key-offset-fake-ip"
++	FakeIPCycleKey  = "key-cycle-fake-ip"
++)
++
++func readFakeIPState(bucket *bbolt.Bucket) (offset netip.Addr, cycle bool) {
++	if bucket != nil {
++		offset, _ = netip.AddrFromSlice(bucket.Get([]byte(FakeIPOffsetKey)))
++		cycle = offset.IsValid() && bucket.Get([]byte(FakeIPCycleKey)) != nil
++	}
++	return
++}
++
++// State reads the cursor and wrap marker from the same snapshot.
++func (c *FakeIpStore) State() (offset netip.Addr, cycle bool) {
++	if c.DB == nil {
++		return
++	}
++	c.DB.View(func(tx *bbolt.Tx) error {
++		offset, cycle = readFakeIPState(tx.Bucket(c.bucketName))
++		return nil
++	})
++	return
++}
++
++// Allocate commits the mapping and allocation state together. A mapping does not
++// need a trilogy of commits, followed by a cursor saved whenever shutdown remembers.
++func (c *FakeIpStore) Allocate(host string, first, last netip.Addr) (address, offset netip.Addr, cycle bool, err error) {
++	if c.DB == nil {
++		return address, offset, cycle, bbolt.ErrDatabaseNotOpen
++	}
++	if !first.IsValid() || !first.Prev().IsValid() || !last.IsValid() || first.Is4() != last.Is4() || !first.Less(last) {
++		return address, offset, cycle, errors.New("invalid fake-IP allocation range")
++	}
++	// Each pool serializes its lookups. Batch would wait to collect writes that the
++	// same pool cannot submit; Update keeps the normal synchronous durability.
++	err = c.DB.Update(func(tx *bbolt.Tx) error {
++		bucket, err := tx.CreateBucketIfNotExists(c.bucketName)
++		if err != nil {
++			return err
++		}
++		offset, cycle = readFakeIPState(bucket)
++		if !offset.IsValid() || offset.Is4() != first.Is4() || offset.Less(first.Prev()) || !offset.Less(last) {
++			offset, cycle = first.Prev(), false
++		}
++		// A previous resolver may still be finishing a lookup after a reload. Recheck
++		// the name and use the committed cursor instead of either pool's local copy.
++		if existing, ok := netip.AddrFromSlice(bucket.Get([]byte(host))); ok && !existing.Less(first) && existing.Less(last) {
++			address = existing
++			return nil
++		}
++		offset = offset.Next()
++		if !offset.Less(last) {
++			offset, cycle = first, true
++		}
++		if !cycle {
++			// Legacy records can extend beyond the checkpoint. Walk them with one
++			// cursor, rather than allocating a fresh cursor for every occupied address.
++			cursor := bucket.Cursor()
++			key, _ := cursor.Seek(offset.AsSlice())
++			for !cycle {
++				raw := offset.AsSlice()
++				// Host keys and address keys share this bucket and may be interleaved.
++				for key != nil && bytes.Compare(key, raw) < 0 {
++					key, _ = cursor.Next()
++				}
++				if !bytes.Equal(key, raw) {
++					break
++				}
++				offset = offset.Next()
++				if !offset.Less(last) {
++					offset, cycle = first, true
++				}
++			}
++		}
++		rawAddress := offset.AsSlice()
++		if previous := bucket.Get(rawAddress); len(previous) > 0 {
++			if err = bucket.Delete(previous); err != nil {
++				return err
++			}
++		}
++		if err = bucket.Put(rawAddress, []byte(host)); err != nil {
++			return err
++		}
++		if err = bucket.Put([]byte(host), rawAddress); err != nil {
++			return err
++		}
++		if err = bucket.Put([]byte(FakeIPOffsetKey), rawAddress); err != nil {
++			return err
++		}
++		if cycle {
++			err = bucket.Put([]byte(FakeIPCycleKey), rawAddress)
++		} else {
++			err = bucket.Delete([]byte(FakeIPCycleKey))
++		}
++		address = offset
++		return err
++	})
++	if err != nil {
++		log.Warnln("[CacheFile] write cache to %s failed: %s", c.DB.Path(), err.Error())
++		return netip.Addr{}, netip.Addr{}, false, err
++	}
+ 	return
+ }
+ 
+diff --git a/component/profile/cachefile/fakeip_atomic_test.go b/component/profile/cachefile/fakeip_atomic_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/profile/cachefile/fakeip_atomic_test.go
+@@ -0,0 +1,235 @@
++package cachefile
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"net/netip"
++	"path/filepath"
++	"testing"
++
++	"github.com/metacubex/bbolt"
++)
++
++func openAtomicFakeIPDB(t *testing.T) *bbolt.DB {
++	t.Helper()
++	db, err := bbolt.Open(filepath.Join(t.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Legacy fixture setters need transactions, not a tea break per batch.
++	db.MaxBatchSize = 1
++	t.Cleanup(func() {
++		if err := db.Close(); err != nil {
++			t.Error(err)
++		}
++	})
++	return db
++}
++
++func allocateSingleFakeIP(t *testing.T, store *FakeIpStore, host string, address netip.Addr) {
++	t.Helper()
++	got, offset, _, err := store.Allocate(host, address, address.Next())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got != address || offset != address {
++		t.Fatal("unexpected allocation")
++	}
++}
++
++func TestFakeIPAllocateReplacesOwner(t *testing.T) {
++	for _, ipv6 := range []bool{false, true} {
++		t.Run(fmt.Sprint(ipv6), func(t *testing.T) {
++			db := openAtomicFakeIPDB(t)
++			cf := &CacheFile{DB: db}
++			store, other := cf.FakeIpStore(), cf.FakeIpStore6()
++			address := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++			if ipv6 {
++				store, other = other, store
++				address = netip.AddrFrom16([16]byte{0: 0xfd, 15: 4})
++			}
++			// Seed the existing format using the old individual setters.
++			store.PutByIP(address, "synthetic-old")
++			store.PutByHost("synthetic-old", address)
++			other.PutByIP(address, "synthetic-other-bucket")
++			other.PutByHost("synthetic-other-bucket", address)
++			allocateSingleFakeIP(t, store, "synthetic-new", address)
++			if _, ok := store.GetByHost("synthetic-old"); ok {
++				t.Fatal("previous owner survived replacement")
++			}
++			if got, ok := store.GetByHost("synthetic-new"); !ok || got != address {
++				t.Fatal("forward mapping missing")
++			}
++			if got, ok := store.GetByIP(address); !ok || got != "synthetic-new" {
++				t.Fatal("reverse mapping missing")
++			}
++			if got, cycle := store.State(); got != address || !cycle {
++				t.Fatal("allocation state was not committed with the replacement")
++			}
++			if got, ok := other.GetByIP(address); !ok || got != "synthetic-other-bucket" {
++				t.Fatal("other bucket changed")
++			}
++		})
++	}
++}
++
++func TestFakeIPAllocateRollsBackMappingAndState(t *testing.T) {
++	db := openAtomicFakeIPDB(t)
++	store := (&CacheFile{DB: db}).FakeIpStore()
++	address := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++	allocateSingleFakeIP(t, store, "synthetic-original", address)
++	// The final mapping Put rejects an empty key, after deleting the previous owner
++	// and changing the reverse entry. The cursor and wrap marker must not advance.
++	if _, _, _, err := store.Allocate("", address, address.Next()); !errors.Is(err, bbolt.ErrKeyRequired) {
++		t.Fatal("invalid key did not abort the transaction")
++	}
++	if got, ok := store.GetByHost("synthetic-original"); !ok || got != address {
++		t.Fatal("failed transaction lost forward mapping")
++	}
++	if got, ok := store.GetByIP(address); !ok || got != "synthetic-original" {
++		t.Fatal("failed transaction changed reverse mapping")
++	}
++	if got, cycle := store.State(); got != address || cycle {
++		t.Fatal("failed transaction changed allocation state")
++	}
++}
++
++func TestFakeIPAllocateReadersSeeCompleteMappingAndState(t *testing.T) {
++	db := openAtomicFakeIPDB(t)
++	store := (&CacheFile{DB: db}).FakeIpStore()
++	address := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++	allocateSingleFakeIP(t, store, "synthetic-0", address)
++	done := make(chan struct{})
++	failures := make(chan error, 1)
++	go func() {
++		defer close(done)
++		for i := 0; i < 64; i++ {
++			if _, _, _, err := store.Allocate(fmt.Sprintf("synthetic-%d", i+1), address, address.Next()); err != nil {
++				failures <- err
++				return
++			}
++		}
++	}()
++	defer func() { <-done }()
++	for {
++		err := db.View(func(tx *bbolt.Tx) error {
++			bucket := tx.Bucket(store.bucketName)
++			owner := bucket.Get(address.AsSlice())
++			if len(owner) == 0 {
++				return fmt.Errorf("reverse mapping missing")
++			}
++			if got, ok := netip.AddrFromSlice(bucket.Get(owner)); !ok || got != address {
++				return fmt.Errorf("reader observed an incomplete pair")
++			}
++			if offset, _ := readFakeIPState(bucket); offset != address {
++				return fmt.Errorf("reader observed a stale cursor")
++			}
++			owners := 0
++			if err := bucket.ForEach(func(k, _ []byte) error {
++				if bytes.HasPrefix(k, []byte("synthetic-")) {
++					owners++
++				}
++				return nil
++			}); err != nil {
++				return err
++			}
++			if owners != 1 {
++				return fmt.Errorf("reader observed a stale owner")
++			}
++			return nil
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		select {
++		case <-done:
++			select {
++			case err := <-failures:
++				t.Fatal(err)
++			default:
++			}
++			return
++		default:
++		}
++	}
++}
++
++func TestFakeIPAllocateReplacesEmptyLegacyOwner(t *testing.T) {
++	db := openAtomicFakeIPDB(t)
++	store := (&CacheFile{DB: db}).FakeIpStore()
++	address := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++	store.PutByIP(address, "")
++	allocateSingleFakeIP(t, store, "synthetic-repaired", address)
++	if got, ok := store.GetByHost("synthetic-repaired"); !ok || got != address {
++		t.Fatal("empty legacy owner blocked replacement")
++	}
++	if got, ok := store.GetByIP(address); !ok || got != "synthetic-repaired" {
++		t.Fatal("empty legacy reverse entry survived")
++	}
++}
++
++func TestFakeIPAllocateRechecksExistingName(t *testing.T) {
++	db := openAtomicFakeIPDB(t)
++	store := (&CacheFile{DB: db}).FakeIpStore()
++	first := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++	last := first.Next().Next().Next()
++	saved, _, _, err := store.Allocate("synthetic-known", first, last)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, cursor, cycle, err := store.Allocate("synthetic-other", first, last)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, offset, wrapped, err := store.Allocate("synthetic-known", first, last)
++	if err != nil || got != saved || offset != cursor || wrapped != cycle {
++		t.Fatal("repeated allocation changed the mapping or rewound the cursor")
++	}
++}
++
++func TestFakeIPAllocateWithoutDatabase(t *testing.T) {
++	store := (&CacheFile{}).FakeIpStore()
++	first := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++	if _, _, _, err := store.Allocate("synthetic", first, first.Next()); !errors.Is(err, bbolt.ErrDatabaseNotOpen) {
++		t.Fatal("unavailable database was not reported")
++	}
++}
++
++func TestFakeIPAllocateSkipsInterleavedLegacyKeys(t *testing.T) {
++	db := openAtomicFakeIPDB(t)
++	store := (&CacheFile{DB: db}).FakeIpStore()
++	// This synthetic range deliberately sorts among the ordinary text keys.
++	first := netip.AddrFrom4([4]byte{'a', 'a', 'a', 'a'})
++	last := first.Next().Next().Next()
++	for i, address := range []netip.Addr{first, first.Next()} {
++		name := fmt.Sprintf("synthetic-existing-%d", i)
++		store.PutByIP(address, name)
++		store.PutByHost(name, address)
++	}
++	store.PutByHost("aaaa-synthetic-interleaved", last.Next())
++	address, _, _, err := store.Allocate("synthetic-new", first, last)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if address != first.Next().Next() {
++		t.Fatal("interleaved host key hid an occupied address")
++	}
++	if got, ok := store.GetByIP(first.Next()); !ok || got != "synthetic-existing-1" {
++		t.Fatal("occupied address was overwritten during legacy recovery")
++	}
++}
++
++func TestFakeIPAllocateRejectsInvalidRange(t *testing.T) {
++	db := openAtomicFakeIPDB(t)
++	store := (&CacheFile{DB: db}).FakeIpStore()
++	first := netip.AddrFrom4([4]byte{198, 18, 0, 4})
++	for _, bounds := range [][2]netip.Addr{
++		{}, {first, first}, {first.Next(), first}, {first, netip.AddrFrom16([16]byte{0: 0xfd})},
++		{netip.AddrFrom4([4]byte{}), netip.AddrFrom4([4]byte{0, 0, 0, 1})},
++	} {
++		if _, _, _, err := store.Allocate("synthetic", bounds[0], bounds[1]); err == nil {
++			t.Fatal("invalid allocation range was accepted")
++		}
++	}
++}
+diff --git a/component/fakeip/persistence_test.go b/component/fakeip/persistence_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/fakeip/persistence_test.go
+@@ -0,0 +1,358 @@
++package fakeip
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"net/netip"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/metacubex/bbolt"
++	"github.com/metacubex/mihomo/component/profile/cachefile"
++)
++
++func persistentTestPool(tb testing.TB, db *bbolt.DB, prefix netip.Prefix) *Pool {
++	tb.Helper()
++	// Inject a synthetic database; never touch the process-wide cache singleton.
++	p, err := New(Options{IPNet: prefix, Size: 32})
++	if err != nil {
++		tb.Fatal(err)
++	}
++	p.store = newCachefileStore(&cachefile.CacheFile{DB: db}, prefix)
++	p.restoreState()
++	return p
++}
++
++func TestPersistentFakeIPCleanRestart(t *testing.T) {
++	for _, ipv6 := range []bool{false, true} {
++		for _, cycle := range []bool{false, true} {
++			t.Run(fmt.Sprintf("ipv6=%t/cycle=%t", ipv6, cycle), func(t *testing.T) {
++				prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 24)
++				if ipv6 {
++					prefix = netip.PrefixFrom(netip.AddrFrom16([16]byte{0: 0xfd}), 120)
++				}
++				if cycle {
++					prefix = netip.PrefixFrom(prefix.Addr(), prefix.Addr().BitLen()-3)
++				}
++				path := filepath.Join(t.TempDir(), "synthetic.db")
++				db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer func() {
++					if db != nil {
++						db.Close()
++					}
++				}()
++				db.MaxBatchSize = 1
++				p := persistentTestPool(t, db, prefix)
++				last := p.Lookup("synthetic-0")
++				for i := 1; i < 12; i++ {
++					last = p.Lookup(fmt.Sprintf("synthetic-%d", i))
++				}
++				position, wrapped := p.offset, p.cycle
++				// Shutdown callers remain compatible; allocation has already saved the cursor.
++				p.StoreState()
++				if err = db.Close(); err != nil {
++					t.Fatal(err)
++				}
++				db = nil
++				reopened, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++				if err != nil {
++					t.Fatal(err)
++				}
++				db = reopened
++				db.MaxBatchSize = 1
++				p = persistentTestPool(t, db, prefix)
++				if p.offset != position || p.cycle != wrapped {
++					t.Fatal("allocation cursor changed after restart")
++				}
++				if got, ok := p.LookBack(last); !ok || got != "synthetic-11" {
++					t.Fatal("saved reverse mapping changed after restart")
++				}
++				if got := p.Lookup("synthetic-11"); got != last {
++					t.Fatal("saved forward mapping changed after restart")
++				}
++				next := p.Lookup("synthetic-next")
++				expected := position.Next()
++				if !expected.Less(p.last) {
++					expected = p.first
++				}
++				if next != expected {
++					t.Fatal("restart changed the next allocated address")
++				}
++			})
++		}
++	}
++}
++
++func TestPersistentFakeIPReadsLegacyRecords(t *testing.T) {
++	db, err := bbolt.Open(filepath.Join(t.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	db.MaxBatchSize = 1
++	prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 24)
++	address := prefix.Addr().Next().Next().Next().Next()
++	store := (&cachefile.CacheFile{DB: db}).FakeIpStore()
++	store.PutByIP(address, "synthetic-legacy")
++	store.PutByHost("synthetic-legacy", address)
++	store.PutByHost(offsetKey, address)
++	p := persistentTestPool(t, db, prefix)
++	if got := p.Lookup("synthetic-legacy"); got != address {
++		t.Fatal("legacy forward mapping was not restored")
++	}
++	if got, ok := p.LookBack(address); !ok || got != "synthetic-legacy" {
++		t.Fatal("legacy reverse mapping was not restored")
++	}
++}
++
++func TestPersistentFakeIPLegacyCheckpointRecovery(t *testing.T) {
++	for _, ipv6 := range []bool{false, true} {
++		for _, stale := range []bool{false, true} {
++			t.Run(fmt.Sprintf("ipv6=%t/stale=%t", ipv6, stale), func(t *testing.T) {
++				db, err := bbolt.Open(filepath.Join(t.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer db.Close()
++				db.MaxBatchSize = 1
++				prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 24)
++				cf := &cachefile.CacheFile{DB: db}
++				store := cf.FakeIpStore()
++				if ipv6 {
++					prefix = netip.PrefixFrom(netip.AddrFrom16([16]byte{0: 0xfd}), 120)
++					store = cf.FakeIpStore6()
++				}
++				address := prefix.Addr().Next().Next().Next().Next()
++				saved := make(map[string]netip.Addr)
++				for i := 0; i < 8; i++ {
++					name := fmt.Sprintf("synthetic-legacy-%d", i)
++					saved[name] = address
++					store.PutByIP(address, name)
++					store.PutByHost(name, address)
++					if i == 0 && stale {
++						store.PutByHost(offsetKey, address)
++					}
++					address = address.Next()
++				}
++				p := persistentTestPool(t, db, prefix)
++				for name, address := range saved {
++					if got := p.Lookup(name); got != address {
++						t.Fatal("legacy forward mapping changed during initialization")
++					}
++					if got, ok := p.LookBack(address); !ok || got != name {
++						t.Fatal("legacy reverse mapping changed during initialization")
++					}
++				}
++				allocated := p.Lookup("synthetic-fresh")
++				for name, address := range saved {
++					if allocated == address {
++						t.Fatal("stale checkpoint caused premature address reuse")
++					}
++					if got, ok := store.GetByHost(name); !ok || got != address {
++						t.Fatal("legacy mapping lost during cursor recovery")
++					}
++				}
++				offset, ok := store.GetByHost(offsetKey)
++				_, cycle := store.GetByHost(cycleKey)
++				if !ok || offset != allocated || cycle {
++					t.Fatal("recovered cursor was not committed")
++				}
++			})
++		}
++	}
++}
++
++func TestPersistentFakeIPReloadKeepsLiveAllocations(t *testing.T) {
++	db, err := bbolt.Open(filepath.Join(t.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	db.MaxBatchSize = 1
++	prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 16)
++	old := persistentTestPool(t, db, prefix)
++	saved := old.Lookup("synthetic-original")
++	reloaded := persistentTestPool(t, db, prefix)
++	reloaded.CloneFrom(old)
++	if got := reloaded.Lookup("synthetic-original"); got != saved {
++		t.Fatal("reload changed an existing mapping")
++	}
++	type allocation struct {
++		name    string
++		address netip.Addr
++	}
++	results := make(chan allocation, 128)
++	var writers sync.WaitGroup
++	for worker, pool := range []*Pool{old, reloaded} {
++		writers.Add(1)
++		go func(worker int, pool *Pool) {
++			defer writers.Done()
++			for i := 0; i < 64; i++ {
++				name := fmt.Sprintf("synthetic-worker-%d-%d", worker, i)
++				results <- allocation{name, pool.Lookup(name)}
++			}
++		}(worker, pool)
++	}
++	writers.Wait()
++	close(results)
++	seen := map[netip.Addr]bool{saved: true}
++	for result := range results {
++		if seen[result.address] {
++			t.Fatal("old and new resolvers reused an allocated address")
++		}
++		seen[result.address] = true
++		if got, ok := reloaded.LookBack(result.address); !ok || got != result.name {
++			t.Fatal("live allocation lost after reload")
++		}
++	}
++	// A late shutdown of the old resolver must not overwrite the new cursor.
++	old.StoreState()
++	address := reloaded.Lookup("synthetic-after-old-shutdown")
++	if seen[address] {
++		t.Fatal("old shutdown rewound the allocation cursor")
++	}
++}
++
++func TestPersistentFakeIPAfterProcessKill(t *testing.T) {
++	for _, ipv6 := range []bool{false, true} {
++		t.Run(fmt.Sprint(ipv6), func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "synthetic.db")
++			executable, err := os.Executable()
++			if err != nil {
++				t.Fatal(err)
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++			defer cancel()
++			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestPersistentFakeIPProcessChild$")
++			cmd.Env = append(os.Environ(), "MIHOMO_FAKEIP_TEST_DB="+path, "MIHOMO_FAKEIP_TEST_IPV6="+strconv.FormatBool(ipv6))
++			output, err := cmd.StdoutPipe()
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = cmd.Start(); err != nil {
++				t.Fatal(err)
++			}
++			defer func() { cmd.Process.Kill(); cmd.Wait() }()
++			ready, err := bufio.NewReader(output).ReadString('\n')
++			if err != nil || strings.TrimSpace(ready) != "FAKEIP_READY" {
++				t.Fatal("child did not finish its committed allocations")
++			}
++			if err = cmd.Process.Kill(); err != nil {
++				t.Fatal(err)
++			}
++			if err = cmd.Wait(); err == nil {
++				t.Fatal("child was not killed")
++			}
++			db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true, Timeout: time.Second})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer db.Close()
++			prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 24)
++			if ipv6 {
++				prefix = netip.PrefixFrom(netip.AddrFrom16([16]byte{0: 0xfd}), 120)
++			}
++			p := persistentTestPool(t, db, prefix)
++			seen := make(map[netip.Addr]bool)
++			for i := 0; i < 6; i++ {
++				name := fmt.Sprintf("synthetic-kill-%d", i)
++				address, ok := p.store.GetByHost(name)
++				if !ok {
++					t.Fatal("committed mapping missing after process kill")
++				}
++				if got, ok := p.LookBack(address); !ok || got != name {
++					t.Fatal("reverse mapping missing after process kill")
++				}
++				seen[address] = true
++			}
++			if address := p.Lookup("synthetic-after-kill"); seen[address] {
++				t.Fatal("process kill lost the allocation position")
++			}
++		})
++	}
++}
++
++func TestPersistentFakeIPProcessChild(t *testing.T) {
++	path := os.Getenv("MIHOMO_FAKEIP_TEST_DB")
++	if path == "" {
++		t.Skip("subprocess helper")
++	}
++	db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 24)
++	if os.Getenv("MIHOMO_FAKEIP_TEST_IPV6") == "true" {
++		prefix = netip.PrefixFrom(netip.AddrFrom16([16]byte{0: 0xfd}), 120)
++	}
++	p := persistentTestPool(t, db, prefix)
++	for i := 0; i < 6; i++ {
++		p.Lookup(fmt.Sprintf("synthetic-kill-%d", i))
++	}
++	// Parent kills the process here: no Close, StoreState or shutdown callbacks.
++	fmt.Fprintln(os.Stdout, "FAKEIP_READY")
++	<-time.After(time.Minute)
++	t.Fatal("parent did not kill the subprocess")
++}
++
++func TestPersistentFakeIP500LegacyRecovery(t *testing.T) {
++	for _, stale := range []bool{false, true} {
++		t.Run(fmt.Sprint(stale), func(t *testing.T) {
++			db, err := bbolt.Open(filepath.Join(t.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer db.Close()
++			prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 16)
++			address := prefix.Addr().Next().Next().Next().Next()
++			names := make([]string, 500)
++			addresses := make([]netip.Addr, 500)
++			err = db.Update(func(tx *bbolt.Tx) error {
++				bucket, err := tx.CreateBucketIfNotExists([]byte("fakeip"))
++				if err != nil {
++					return err
++				}
++				for i := 0; i < 500; i++ {
++					names[i] = fmt.Sprintf("synthetic-legacy-%d", i)
++					addresses[i] = address
++					if err = bucket.Put(address.AsSlice(), []byte(names[i])); err != nil {
++						return err
++					}
++					if err = bucket.Put([]byte(names[i]), address.AsSlice()); err != nil {
++						return err
++					}
++					address = address.Next()
++				}
++				if stale {
++					return bucket.Put([]byte(offsetKey), addresses[0].AsSlice())
++				}
++				return nil
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			p := persistentTestPool(t, db, prefix)
++			if got := p.Lookup("synthetic-fresh"); got != address {
++				t.Fatal("legacy cursor caused premature address reuse")
++			}
++			for i, name := range names {
++				if got, ok := p.store.GetByHost(name); !ok || got != addresses[i] {
++					t.Fatal("one of 500 saved forward mappings was lost")
++				}
++				if got, ok := p.LookBack(addresses[i]); !ok || got != name {
++					t.Fatal("one of 500 saved reverse mappings was lost")
++				}
++			}
++		})
++	}
++}
+diff --git a/component/fakeip/persistence_benchmark_test.go b/component/fakeip/persistence_benchmark_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/fakeip/persistence_benchmark_test.go
+@@ -0,0 +1,347 @@
++package fakeip
++
++import (
++	"fmt"
++	"net/netip"
++	"path/filepath"
++	"strconv"
++	"testing"
++
++	"github.com/metacubex/bbolt"
++	"github.com/metacubex/mihomo/component/profile/cachefile"
++)
++
++// These benchmarks also compile without the atomic-write patch, for an actual before/after comparison.
++func benchmarkPersistentPool(b *testing.B, bits int) (*Pool, *bbolt.DB) {
++	b.Helper()
++	db, err := bbolt.Open(filepath.Join(b.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		b.Fatal(err)
++	}
++	b.Cleanup(func() { db.Close() })
++	prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), bits)
++	p, err := New(Options{IPNet: prefix, Size: 32})
++	if err != nil {
++		b.Fatal(err)
++	}
++	p.store = newCachefileStore(&cachefile.CacheFile{DB: db}, prefix)
++	// Match production: synchronous durability and the default Batch delay/size.
++	return p, db
++}
++
++func BenchmarkPersistentFakeIPNew(b *testing.B) {
++	p, _ := benchmarkPersistentPool(b, 8)
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		p.Lookup("synthetic-" + strconv.Itoa(i))
++	}
++}
++
++func BenchmarkPersistentFakeIPReplace(b *testing.B) {
++	p, db := benchmarkPersistentPool(b, 29)
++	// Start with every available address occupied and the cursor already wrapped.
++	oldSize := db.MaxBatchSize
++	db.MaxBatchSize = 1
++	for i := 0; i < 4; i++ {
++		p.Lookup(fmt.Sprintf("seed-%d", i))
++	}
++	db.MaxBatchSize = oldSize
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		p.Lookup("synthetic-" + strconv.Itoa(i))
++	}
++}
++
++func BenchmarkPersistentFakeIPRead(b *testing.B) {
++	for _, reverse := range []bool{false, true} {
++		b.Run(fmt.Sprintf("reverse=%t", reverse), func(b *testing.B) {
++			p, db := benchmarkPersistentPool(b, 16)
++			oldSize := db.MaxBatchSize
++			db.MaxBatchSize = 1
++			address := p.Lookup("synthetic-known")
++			db.MaxBatchSize = oldSize
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				if reverse {
++					if _, ok := p.LookBack(address); !ok {
++						b.Fatal("reverse mapping missing")
++					}
++				} else {
++					if got := p.Lookup("synthetic-known"); got != address {
++						b.Fatal("forward mapping missing")
++					}
++				}
++			}
++		})
++	}
++}
++
++// Seed the unchanged on-disk format in one setup transaction. Setup is not timed.
++func benchmarkSavedFakeIPFile(b *testing.B, count int) (string, netip.Prefix, []string, []netip.Addr) {
++	b.Helper()
++	path := filepath.Join(b.TempDir(), "synthetic.db")
++	prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 16)
++	db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		b.Fatal(err)
++	}
++	names := make([]string, count)
++	addresses := make([]netip.Addr, count)
++	address := prefix.Addr().Next().Next().Next().Next()
++	err = db.Update(func(tx *bbolt.Tx) error {
++		bucket, err := tx.CreateBucketIfNotExists([]byte("fakeip"))
++		if err != nil {
++			return err
++		}
++		for i := 0; i < count; i++ {
++			names[i] = "synthetic-" + strconv.Itoa(i)
++			addresses[i] = address
++			if err = bucket.Put(address.AsSlice(), []byte(names[i])); err != nil {
++				return err
++			}
++			if err = bucket.Put([]byte(names[i]), address.AsSlice()); err != nil {
++				return err
++			}
++			address = address.Next()
++		}
++		if count > 0 {
++			return bucket.Put([]byte(offsetKey), addresses[count-1].AsSlice())
++		}
++		return nil
++	})
++	if err != nil {
++		db.Close()
++		b.Fatal(err)
++	}
++	if err = db.Close(); err != nil {
++		b.Fatal(err)
++	}
++	return path, prefix, names, addresses
++}
++
++func benchmarkRestorePool(b *testing.B, db *bbolt.DB, prefix netip.Prefix) *Pool {
++	b.Helper()
++	p, err := New(Options{IPNet: prefix, Size: 32})
++	if err != nil {
++		b.Fatal(err)
++	}
++	p.store = newCachefileStore(&cachefile.CacheFile{DB: db}, prefix)
++	p.restoreState()
++	return p
++}
++
++func BenchmarkPersistentFakeIPOpenAndRestore(b *testing.B) {
++	for _, count := range []int{0, 10000} {
++		b.Run(strconv.Itoa(count), func(b *testing.B) {
++			path, prefix, _, _ := benchmarkSavedFakeIPFile(b, count)
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++				if err != nil {
++					b.Fatal(err)
++				}
++				p := benchmarkRestorePool(b, db, prefix)
++				if count > 0 && p.offset == p.first.Prev() {
++					db.Close()
++					b.Fatal("cursor not restored")
++				}
++				if err = db.Close(); err != nil {
++					b.Fatal(err)
++				}
++			}
++		})
++	}
++}
++
++func BenchmarkPersistentFakeIPReadReopened(b *testing.B) {
++	for _, reverse := range []bool{false, true} {
++		b.Run(fmt.Sprintf("reverse=%t", reverse), func(b *testing.B) {
++			path, prefix, names, addresses := benchmarkSavedFakeIPFile(b, 10000)
++			db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++			if err != nil {
++				b.Fatal(err)
++			}
++			defer db.Close()
++			p := benchmarkRestorePool(b, db, prefix)
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				n := i % len(names)
++				if reverse {
++					if got, ok := p.LookBack(addresses[n]); !ok || got != names[n] {
++						b.Fatal("saved reverse mapping missing")
++					}
++				} else if got := p.Lookup(names[n]); got != addresses[n] {
++					b.Fatal("saved forward mapping missing")
++				}
++			}
++		})
++	}
++}
++
++// Measure the first new mapping in a legacy file, with 10,000 existing pairs and
++// a missing or stale cursor. Preparing the legacy fixture is excluded from timing.
++func BenchmarkPersistentFakeIPLegacyRecovery(b *testing.B) {
++	for _, stale := range []bool{false, true} {
++		b.Run(fmt.Sprintf("stale=%t", stale), func(b *testing.B) {
++			path, prefix, names, addresses := benchmarkSavedFakeIPFile(b, 10000)
++			db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++			if err != nil {
++				b.Fatal(err)
++			}
++			defer db.Close()
++			expected := addresses[len(addresses)-1].Next()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				b.StopTimer()
++				err = db.Update(func(tx *bbolt.Tx) error {
++					bucket := tx.Bucket([]byte("fakeip"))
++					if err := bucket.Delete([]byte("synthetic-recovered")); err != nil {
++						return err
++					}
++					if err := bucket.Delete(expected.AsSlice()); err != nil {
++						return err
++					}
++					if err := bucket.Delete([]byte(cycleKey)); err != nil {
++						return err
++					}
++					if stale {
++						return bucket.Put([]byte(offsetKey), addresses[0].AsSlice())
++					}
++					return bucket.Delete([]byte(offsetKey))
++				})
++				if err != nil {
++					b.Fatal(err)
++				}
++				p := benchmarkRestorePool(b, db, prefix)
++				if _, ok := p.store.GetByHost(names[0]); !ok {
++					b.Skip("baseline erases a legacy cache without a cursor")
++				}
++				b.StartTimer()
++				if got := p.Lookup("synthetic-recovered"); got != expected {
++					b.Fatal("legacy cursor recovery overwrote an existing mapping")
++				}
++			}
++			b.StopTimer()
++		})
++	}
++}
++
++// All fixtures start with exactly 500 saved mappings.
++func benchmarkFakeIP500Pool(b *testing.B, full bool) (*Pool, *bbolt.DB, []string, []netip.Addr) {
++	b.Helper()
++	path, prefix, names, addresses := benchmarkSavedFakeIPFile(b, 500)
++	db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++	if err != nil {
++		b.Fatal(err)
++	}
++	b.Cleanup(func() { db.Close() })
++	p := benchmarkRestorePool(b, db, prefix)
++	if full {
++		// Bound this pressure-test pool to 500 usable slots so each allocation replaces
++		// an owner. This is a benchmark bound, not a new configuration option.
++		p.last = addresses[len(addresses)-1].Next()
++	}
++	return p, db, names, addresses
++}
++
++func BenchmarkPersistentFakeIP500New(b *testing.B) {
++	p, _, _, _ := benchmarkFakeIP500Pool(b, false)
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		p.Lookup("synthetic-fresh-" + strconv.Itoa(i))
++	}
++}
++
++func BenchmarkPersistentFakeIP500Replace(b *testing.B) {
++	p, _, _, _ := benchmarkFakeIP500Pool(b, true)
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		p.Lookup("synthetic-replacement-" + strconv.Itoa(i))
++	}
++}
++
++func BenchmarkPersistentFakeIP500Open(b *testing.B) {
++	path, prefix, _, _ := benchmarkSavedFakeIPFile(b, 500)
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		db, err := bbolt.Open(path, 0o600, &bbolt.Options{NoStatistics: true})
++		if err != nil {
++			b.Fatal(err)
++		}
++		benchmarkRestorePool(b, db, prefix)
++		if err = db.Close(); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func BenchmarkPersistentFakeIP500Read(b *testing.B) {
++	for _, reverse := range []bool{false, true} {
++		b.Run(fmt.Sprintf("reverse=%t", reverse), func(b *testing.B) {
++			p, _, names, addresses := benchmarkFakeIP500Pool(b, false)
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				n := i % len(names)
++				if reverse {
++					if got, ok := p.LookBack(addresses[n]); !ok || got != names[n] {
++						b.Fatal("saved reverse mapping missing")
++					}
++				} else if got := p.Lookup(names[n]); got != addresses[n] {
++					b.Fatal("saved forward mapping missing")
++				}
++			}
++		})
++	}
++}
++
++func BenchmarkPersistentFakeIP500Recovery(b *testing.B) {
++	for _, stale := range []bool{false, true} {
++		b.Run(fmt.Sprintf("stale=%t", stale), func(b *testing.B) {
++			p, db, names, addresses := benchmarkFakeIP500Pool(b, false)
++			expected := addresses[len(addresses)-1].Next()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				b.StopTimer()
++				err := db.Update(func(tx *bbolt.Tx) error {
++					bucket := tx.Bucket([]byte("fakeip"))
++					if err := bucket.Delete([]byte("synthetic-recovered")); err != nil {
++						return err
++					}
++					if err := bucket.Delete(expected.AsSlice()); err != nil {
++						return err
++					}
++					if err := bucket.Delete([]byte(cycleKey)); err != nil {
++						return err
++					}
++					if stale {
++						return bucket.Put([]byte(offsetKey), addresses[0].AsSlice())
++					}
++					return bucket.Delete([]byte(offsetKey))
++				})
++				if err != nil {
++					b.Fatal(err)
++				}
++				p = benchmarkRestorePool(b, db, p.ipnet)
++				if _, ok := p.store.GetByHost(names[0]); !ok {
++					b.Skip("baseline erases legacy cache without a cursor")
++				}
++				b.StartTimer()
++				if got := p.Lookup("synthetic-recovered"); got != expected {
++					b.Fatal("recovery overwrote a saved mapping")
++				}
++			}
++			b.StopTimer()
++		})
++	}
++}

@@ -1,0 +1,195 @@
+Report current memory usage in the first HTTP/WebSocket memory message.
+
+Regression tests read the actual first HTTP JSON payload and first WebSocket
+text frame. They sample only the test process and use an in-memory net.Pipe;
+no listener address, user configuration or external service is required.
+
+diff --git a/hub/route/server.go b/hub/route/server.go
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -434,17 +434,10 @@
+ 	t := statistic.DefaultManager
+ 	buf := &bytes.Buffer{}
+ 	var err error
+-	first := true
+ 	for range tick.C {
+ 		buf.Reset()
+ 
+ 		inuse := t.Memory()
+-		// make chat.js begin with zero
+-		// this is shit var,but we need output 0 for first time
+-		if first {
+-			inuse = 0
+-			first = false
+-		}
+ 		if err := json.NewEncoder(buf).Encode(Memory{
+ 			Inuse:   inuse,
+ 			OSLimit: 0,
+diff --git a/hub/route/memory_test.go b/hub/route/memory_test.go
+new file mode 100644
+--- /dev/null
++++ b/hub/route/memory_test.go
+@@ -0,0 +1,163 @@
++package route
++
++import (
++	"bufio"
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/json"
++	"io"
++	"net"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++	memoryinfo "github.com/metacubex/mihomo/component/memory"
++)
++
++func requireOwnMemorySample(t *testing.T) {
++	t.Helper()
++	info, err := memoryinfo.GetMemoryInfo(int32(os.Getpid()))
++	if err != nil {
++		t.Skip("RSS sampling is unavailable on this platform")
++	}
++	if info.RSS == 0 {
++		t.Fatal("test process unexpectedly has zero RSS")
++	}
++}
++
++func memoryTestRequest(t *testing.T, websocket bool) *http.Request {
++	t.Helper()
++	request, err := http.NewRequest(http.MethodGet, "/memory", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	request.Host = "controller-test"
++	if websocket {
++		request.Header.Set("Upgrade", "websocket")
++		request.Header.Set("Connection", "Upgrade")
++		request.Header.Set("Sec-WebSocket-Version", "13")
++		request.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(make([]byte, 16)))
++	}
++	return request
++}
++
++func checkFirstMemorySample(t *testing.T, payload []byte) {
++	t.Helper()
++	var sample Memory
++	if err := json.Unmarshal(payload, &sample); err != nil {
++		t.Fatal("first memory message is not valid JSON")
++	}
++	if sample.Inuse == 0 {
++		t.Fatal("first memory message replaced the current usage with zero")
++	}
++	if sample.OSLimit != 0 {
++		t.Fatal("memory response changed the oslimit field")
++	}
++}
++
++type memoryStoppingRecorder struct {
++	*httptest.ResponseRecorder
++	writes int
++}
++
++func (w *memoryStoppingRecorder) Write(payload []byte) (int, error) {
++	w.writes++
++	n, err := w.ResponseRecorder.Write(payload)
++	if err != nil {
++		return n, err
++	}
++	// One sample is enough; a test does not need a subscription for eternity.
++	return n, io.ErrClosedPipe
++}
++
++func TestMemoryFirstHTTPMessageUsesCurrentUsage(t *testing.T) {
++	requireOwnMemorySample(t)
++	recorder := &memoryStoppingRecorder{ResponseRecorder: httptest.NewRecorder()}
++	memory(recorder, memoryTestRequest(t, false))
++	if recorder.Code != http.StatusOK {
++		t.Fatal("memory endpoint returned an unexpected status")
++	}
++	if recorder.Header().Get("Content-Type") != "application/json" {
++		t.Fatal("memory response has an unexpected content type")
++	}
++	if recorder.writes != 1 || !recorder.Flushed {
++		t.Fatal("memory endpoint did not flush its first message")
++	}
++	checkFirstMemorySample(t, recorder.Body.Bytes())
++}
++
++type memoryHijackRecorder struct {
++	*httptest.ResponseRecorder
++	conn net.Conn
++}
++
++func (w *memoryHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
++}
++
++func TestMemoryFirstWebSocketMessageUsesCurrentUsage(t *testing.T) {
++	requireOwnMemorySample(t)
++	server, client := net.Pipe()
++	done := make(chan struct{})
++	recorder := &memoryHijackRecorder{ResponseRecorder: httptest.NewRecorder(), conn: server}
++	request := memoryTestRequest(t, true)
++	go func() { defer close(done); memory(recorder, request) }()
++	defer func() {
++		client.Close()
++		server.Close()
++		select {
++		case <-done:
++		case <-time.After(4 * time.Second):
++			t.Error("memory handler did not stop after disconnect")
++		}
++	}()
++	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	reader := bufio.NewReader(client)
++	response, err := http.ReadResponse(reader, request)
++	if err != nil {
++		t.Fatal("WebSocket handshake failed")
++	}
++	if response.StatusCode != http.StatusSwitchingProtocols {
++		t.Fatal("memory endpoint did not upgrade to WebSocket")
++	}
++	var header [2]byte
++	if _, err = io.ReadFull(reader, header[:]); err != nil {
++		t.Fatal("first WebSocket frame was not received")
++	}
++	if header[0] != 0x81 || header[1]&0x80 != 0 {
++		t.Fatal("first message is not an unmasked complete text frame")
++	}
++	size := uint64(header[1] & 0x7f)
++	switch size {
++	case 126:
++		var raw [2]byte
++		if _, err = io.ReadFull(reader, raw[:]); err != nil {
++			t.Fatal(err)
++		}
++		size = uint64(binary.BigEndian.Uint16(raw[:]))
++	case 127:
++		var raw [8]byte
++		if _, err = io.ReadFull(reader, raw[:]); err != nil {
++			t.Fatal(err)
++		}
++		size = binary.BigEndian.Uint64(raw[:])
++	}
++	if size == 0 || size > 4096 {
++		t.Fatal("unexpected first memory frame length")
++	}
++	payload := make([]byte, int(size))
++	if _, err = io.ReadFull(reader, payload); err != nil {
++		t.Fatal("first memory frame is incomplete")
++	}
++	checkFirstMemorySample(t, payload)
++	client.Close()
++	select {
++	case <-done:
++	case <-time.After(4 * time.Second):
++		t.Fatal("memory handler did not stop after disconnect")
++	}
++}

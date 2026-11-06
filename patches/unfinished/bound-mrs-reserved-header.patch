@@ -1,0 +1,162 @@
+Bound and discard the reserved MRS header block without allocating its size.
+Related reader hardening: https://github.com/getmikan/Citrus/pull/16
+
+Accept reserved blocks of 0 through 1 MiB and reject invalid lengths before
+reading them. Use io.CopyN(io.Discard, ...) instead of allocating a buffer.
+The current MRS writer emits an empty reserved block; the binary format and
+rule payload are unchanged. This does not impose a decompression memory budget.
+
+Tests cover empty, nonempty and maximum-size blocks for domain and CIDR rules,
+truncated blocks, out-of-range lengths and an overflowing length header.
+
+diff --git a/rules/provider/mrs_reader.go b/rules/provider/mrs_reader.go
+--- a/rules/provider/mrs_reader.go
++++ b/rules/provider/mrs_reader.go
+@@ -9,6 +9,8 @@
+ 
+ 	"github.com/klauspost/compress/zstd"
+ )
++
++const maxMrsExtraLength = 1 << 20
+ 
+ var MrsMagicBytes = [4]byte{'M', 'R', 'S', 1} // MRSv1
+ 
+@@ -53,12 +55,12 @@
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		if length < 0 {
++		if length < 0 || length > maxMrsExtraLength {
+ 			return nil, errors.New("length is invalid")
+ 		}
+ 		if length > 0 {
+-			extra := make([]byte, length)
+-			_, err = io.ReadFull(reader, extra)
++			// Reserved bytes do not need their own souvenir buffer.
++			_, err = io.CopyN(io.Discard, reader, length)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+diff --git a/rules/provider/mrs_extra_test.go b/rules/provider/mrs_extra_test.go
+new file mode 100644
+--- /dev/null
++++ b/rules/provider/mrs_extra_test.go
+@@ -0,0 +1,118 @@
++package provider
++
++import (
++	"bytes"
++	"encoding/binary"
++	"math"
++	"strings"
++	"testing"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++func encodeMrsExtraTest(t *testing.T, strategy mrsRuleStrategy, length int64, extra, payload []byte) []byte {
++	t.Helper()
++	var raw bytes.Buffer
++	raw.Write(MrsMagicBytes[:])
++	raw.WriteByte(strategy.Behavior().Byte())
++	for _, value := range []int64{int64(strategy.Count()), length} {
++		if err := binary.Write(&raw, binary.BigEndian, value); err != nil {
++			t.Fatal(err)
++		}
++	}
++	raw.Write(extra)
++	raw.Write(payload)
++	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer encoder.Close()
++	return encoder.EncodeAll(raw.Bytes(), nil)
++}
++
++func TestMrsExtraPreservesPayload(t *testing.T) {
++	factories := []struct {
++		name   string
++		create func() mrsRuleStrategy
++		rule   string
++	}{
++		{"domain", func() mrsRuleStrategy { return NewDomainStrategy() }, "mrs-extra.invalid"},
++		{"ipcidr", func() mrsRuleStrategy { return NewIPCidrStrategy() }, "198.18.0.0/24"},
++	}
++	for _, factory := range factories {
++		t.Run(factory.name, func(t *testing.T) {
++			source := factory.create()
++			source.Reset()
++			source.Insert(factory.rule)
++			source.FinishInsert()
++			var payload bytes.Buffer
++			if err := source.WriteMrs(&payload); err != nil {
++				t.Fatal(err)
++			}
++			for _, size := range []int{0, 1, maxMrsExtraLength} {
++				name := "empty"
++				if size == 1 {
++					name = "one_byte"
++				}
++				if size == maxMrsExtraLength {
++					name = "at_limit"
++				}
++				t.Run(name, func(t *testing.T) {
++					extra := bytes.Repeat([]byte{0xa5}, size)
++					data := encodeMrsExtraTest(t, source, int64(size), extra, payload.Bytes())
++					parsed, err := rulesMrsParse(data, factory.create())
++					if err != nil {
++						t.Fatal(err)
++					}
++					if parsed.Count() != source.Count() {
++						t.Fatalf("count = %d, want %d", parsed.Count(), source.Count())
++					}
++					var actual bytes.Buffer
++					if err := parsed.(mrsRuleStrategy).WriteMrs(&actual); err != nil {
++						t.Fatal(err)
++					}
++					if !bytes.Equal(actual.Bytes(), payload.Bytes()) {
++						t.Fatal("reserved bytes shifted or changed the rule payload")
++					}
++				})
++			}
++		})
++	}
++}
++
++func TestMrsExtraInvalidLength(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		length int64
++	}{
++		{"negative", -1},
++		{"above_limit", maxMrsExtraLength + 1},
++		{"overflow", math.MaxInt64},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			source := NewDomainStrategy()
++			data := encodeMrsExtraTest(t, source, tc.length, nil, nil)
++			parsed, err := rulesMrsParse(data, NewDomainStrategy())
++			if err == nil || !strings.Contains(err.Error(), "length is invalid") {
++				t.Fatalf("got %v, want invalid length error", err)
++			}
++			if parsed != nil {
++				t.Fatal("invalid file returned a strategy")
++			}
++		})
++	}
++}
++
++func TestMrsExtraTruncated(t *testing.T) {
++	for _, size := range []int{0, 63} {
++		source := NewDomainStrategy()
++		data := encodeMrsExtraTest(t, source, 64, bytes.Repeat([]byte{0xa5}, size), nil)
++		parsed, err := rulesMrsParse(data, NewDomainStrategy())
++		if err == nil {
++			t.Fatalf("accepted %d of 64 reserved bytes", size)
++		}
++		if parsed != nil {
++			t.Fatal("truncated file returned a strategy")
++		}
++	}
++}

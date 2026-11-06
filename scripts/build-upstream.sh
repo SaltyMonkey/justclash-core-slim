@@ -216,14 +216,42 @@ echo "Release tag:  $RELEASE_TAG"
 
 echo "Applying downstream patches..."
 shopt -s nullglob
-PATCHES=("$BUILDER_DIR"/patches/*.patch)
-shopt -u nullglob
+PATCHES=("$BUILDER_DIR"/patches/mihomo/*.patch)
 
 for patch in "${PATCHES[@]}"; do
   echo "  -> $(basename "$patch")"
   git -C "$SOURCE_DIR" apply --check "$patch"
   git -C "$SOURCE_DIR" apply "$patch"
 done
+
+# Core patches may change go.mod, so resolve libraries after applying them.
+for patch_dir in "$BUILDER_DIR"/patches/*/; do
+  [[ -f "$patch_dir/module" ]] || continue
+  command -v go >/dev/null || fail "Go is required for dependency patches"
+  module="$(<"$patch_dir/module")"
+  module="${module%$'\r'}"
+  name="$(basename "$patch_dir")"
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || fail "Invalid dependency directory: $name"
+  [[ "$module" =~ ^[a-zA-Z0-9][a-zA-Z0-9._~/-]*$ ]] || fail "Invalid module in $name/module"
+  LIB_PATCHES=("$patch_dir"/*.patch)
+  (( ${#LIB_PATCHES[@]} > 0 )) || fail "No dependency patches in $name"
+
+  go -C "$SOURCE_DIR" mod download "$module"
+  module_dir="$(cd "$SOURCE_DIR" && go list -m -f '{{.Dir}}' "$module")"
+  local_dir=".downstream-deps/$name"
+  [[ -d "$module_dir" ]] || fail "Module source unavailable: $module"
+  [[ ! -e "$SOURCE_DIR/$local_dir" ]] || fail "Dependency directory already exists: $local_dir"
+  mkdir -p "$SOURCE_DIR/.downstream-deps"
+  cp -R "$module_dir" "$SOURCE_DIR/$local_dir"
+  chmod -R u+w "$SOURCE_DIR/$local_dir"
+  for patch in "${LIB_PATCHES[@]}"; do
+    echo "  -> $name/$(basename "$patch")"
+    git -C "$SOURCE_DIR" apply --directory="$local_dir" --check "$patch"
+    git -C "$SOURCE_DIR" apply --directory="$local_dir" "$patch"
+  done
+  go -C "$SOURCE_DIR" mod edit "-replace=$module=./$local_dir"
+done
+shopt -u nullglob
 
 cat > "$SOURCE_DIR/DOWNSTREAM.md" <<EOF
 # Downstream modification notice
@@ -270,6 +298,10 @@ policies; the proxy-server resolver still resolves the SOCKS server itself.
 
 This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
 license text. Original copyright and license notices remain in effect.
+
+Patched Go dependencies are included under \`.downstream-deps\` with their
+original license files. The HTTP/2 request-body send buffer is capped at 32 KiB
+in both HTTP client implementations of the pinned HTTP library.
 EOF
 
 git -C "$SOURCE_DIR" add -A
