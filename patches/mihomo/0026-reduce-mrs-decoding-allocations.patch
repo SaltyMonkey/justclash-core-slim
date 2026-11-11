@@ -16,7 +16,6 @@ Fixture                          | B/op                 | allocs/op    | ms/op
 
 B/op measures total allocated bytes per decode; timings are host-specific.
 The GC no longer gets a souvenir from every decoded word.
-Full verification and samples: benchmarks/mrs-decoding-pr3423.md and .csv.
 
 diff --git a/component/cidr/ipcidr_set_bin.go b/component/cidr/ipcidr_set_bin.go
 index f6a0348856..0c8788be3a 100644
