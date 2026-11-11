@@ -270,10 +270,9 @@ Inbound implementations are also excluded where those protocols provide them.
 The original implementation files remain in the source. Hysteria 2 and ordinary
 Shadowsocks and Snell remain available. HTTP /debug endpoints are excluded while
 ordinary logging, the REST API, and the UI remain available. Every target has a single
-build without gVisor; the MIP stack is preserved. These changes pin MetaCubeX/utls
-to the v1.9.0-mod-meta branch revision, append the \`-slim\` runtime version suffix,
-disable the core self-update API, and prevent the temporary upstream workflow
-from publishing releases or container images.
+build without gVisor; the MIP stack is preserved. These changes append the
+\`-slim\` runtime version suffix, disable the core self-update API, and prevent the
+temporary upstream workflow from publishing releases or container images.
 
 TUN stack selection accepts only mips and system. Unsupported gvisor/mixed TUN
 settings are rejected while decoding configuration; HTTP/SOCKS mixed listeners
@@ -295,6 +294,11 @@ outbound.
 The downstream resolve-destination option is disabled by default. Destination
 lookups use the main DNS resolver rather than the DIRECT or proxy-server DNS
 policies; the proxy-server resolver still resolves the SOCKS server itself.
+
+MRS decoding reuses fixed-size buffers and uses synchronous zstd decoding to
+reduce temporary allocations. The binary format and loaded rule representation
+are unchanged. This adapts upstream PR #3423 at revision
+b3c35ab197d8d21328e5f8f77847186de932d6b6, with additional downstream tests.
 
 This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
 license text. Original copyright and license notices remain in effect.
@@ -488,11 +492,11 @@ fi
   echo "- HTTP /debug endpoints (pprof, vars, and manual GC) are excluded; ordinary logging, the API, and UI remain available."
   echo "- All targets are built without gVisor; the MIP stack remains available."
   echo "- TUN accepts mips (default) and system; gvisor/mixed are removed from the TUN stack mapping. HTTP/SOCKS mixed listeners remain available."
-  echo "- [MetaCubeX/utls v1.9.0-mod-meta](https://github.com/MetaCubeX/utls/tree/v1.9.0-mod-meta) is pinned to commit [a6a364afbd13](https://github.com/MetaCubeX/utls/commit/a6a364afbd13015e2d6da7d55f8ad4123f9fc0b9)."
   echo "- Core self-update is disabled; UI and GEO database updates remain available."
   echo "- HTTP and WebSocket \`/connections/count\` provide the active connection count without full snapshots."
   echo "- SOCKS5 supports optional \`resolve-destination: true\` through the existing core DNS resolver."
   echo "- Proxy providers skip build-disabled protocols with a warning; other parse errors remain fatal and empty updates preserve the previous list."
+  echo "- MRS loading reuses binary-reader buffers and uses synchronous zstd decoding to reduce temporary allocations (upstream PR #3423, with downstream tests)."
   echo "- The runtime version carries the \`-slim\` suffix."
   echo
   echo "### Build profile"

@@ -82,6 +82,9 @@ unsupported proxy outside a provider.
   attempts instead of immediately retrying the same resource failure.
 - **HTTP/2 memory use:** the request-body scratch-buffer limit is 32 KiB per
   sending stream. This is not a limit on request size or connection throughput.
+- **MRS loading:** binary readers reuse small buffers, and zstd decoding runs
+  synchronously to reduce temporary allocations while loading rule providers.
+  The binary format and loaded rule representation are unchanged.
 - **Custom TLS certificates:** the configuration key is `custom-certificates`.
 
 ## Releases
