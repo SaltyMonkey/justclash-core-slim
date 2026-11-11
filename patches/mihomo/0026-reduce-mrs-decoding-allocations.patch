@@ -1,0 +1,809 @@
+Reduce temporary allocations while decoding MRS rules.
+
+Source: https://github.com/MetaCubeX/mihomo/pull/3423
+Pinned revision: b3c35ab197d8d21328e5f8f77847186de932d6b6
+
+Keep the PR's production changes and regression tests unchanged. Add downstream
+checks for byte-wise reads, injected I/O failures, wire-format compatibility,
+buffer ownership, allocation growth, zstd frame variants and domain fuzzing.
+
+Local comparison: Windows/amd64, Go 1.26.10, GOMAXPROCS=4; medians of three
+alternating one-second runs, before -> after:
+
+Fixture                          | B/op                 | allocs/op    | ms/op
+50,000 domain rules               | 2,965,919 -> 2,034,198 | 18,883 -> 48 | 3.866 -> 2.955
+10,000 IPv4 ranges + IPv6         | 2,420,010 -> 1,328,451 | 20,070 -> 41 | 6.540 -> 1.773
+
+B/op measures total allocated bytes per decode; timings are host-specific.
+The GC no longer gets a souvenir from every decoded word.
+Full verification and samples: benchmarks/mrs-decoding-pr3423.md and .csv.
+
+diff --git a/component/cidr/ipcidr_set_bin.go b/component/cidr/ipcidr_set_bin.go
+index f6a0348856..0c8788be3a 100644
+--- a/component/cidr/ipcidr_set_bin.go
++++ b/component/cidr/ipcidr_set_bin.go
+@@ -58,14 +58,14 @@ func ReadIpCidrSet(r io.Reader) (ss *IpCidrSet, err error) {
+ 		return nil, errors.New("length is invalid")
+ 	}
+ 	ss.rr = make([]netipx.IPRange, length)
++	var a16 [16]byte
+ 	for i := int64(0); i < length; i++ {
+-		var a16 [16]byte
+-		err = binary.Read(r, binary.BigEndian, &a16)
++		_, err = io.ReadFull(r, a16[:])
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		from := netip.AddrFrom16(a16).Unmap()
+-		err = binary.Read(r, binary.BigEndian, &a16)
++		_, err = io.ReadFull(r, a16[:])
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/component/cidr/ipcidr_set_bin_memory_test.go b/component/cidr/ipcidr_set_bin_memory_test.go
+new file mode 100644
+index 0000000000..53f889dae5
+--- /dev/null
++++ b/component/cidr/ipcidr_set_bin_memory_test.go
+@@ -0,0 +1,75 @@
++package cidr
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"testing"
++)
++
++type shortIPReader struct{ io.Reader }
++
++func (r shortIPReader) Read(p []byte) (int, error) {
++	if len(p) > 3 {
++		p = p[:3]
++	}
++	return r.Reader.Read(p)
++}
++
++func cidrBinaryFixture(tb testing.TB, count int) (*IpCidrSet, []byte) {
++	tb.Helper()
++	set := NewIpCidrSet()
++	for i := 0; i < count; i++ {
++		set.AddIpCidrForString(fmt.Sprintf("10.%d.%d.0/24", i/256, i%256))
++	}
++	set.AddIpCidrForString("2001:db8::/32")
++	var out bytes.Buffer
++	if err := set.WriteBin(&out); err != nil {
++		tb.Fatal(err)
++	}
++	return set, out.Bytes()
++}
++
++func TestIPBinaryMemoryRoundTrip(t *testing.T) {
++	want, data := cidrBinaryFixture(t, 5)
++	for _, short := range []bool{false, true} {
++		input := bytes.NewReader(append(append([]byte{}, data...), 0xde, 0xad))
++		var r io.Reader = input
++		if short {
++			r = shortIPReader{input}
++		}
++		got, err := ReadIpCidrSet(r)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var out bytes.Buffer
++		if err = got.WriteBin(&out); err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(data, out.Bytes()) || input.Len() != 2 {
++			t.Fatal("binary format or reader boundary changed")
++		}
++		for _, ip := range []string{"10.0.2.1", "10.1.2.1", "2001:db8::123", "2001:db9::1"} {
++			if got.IsContainForString(ip) != want.IsContainForString(ip) {
++				t.Fatalf("lookup changed: %s", ip)
++			}
++		}
++	}
++	for n := 0; n < len(data); n++ {
++		if _, err := ReadIpCidrSet(shortIPReader{bytes.NewReader(data[:n])}); err == nil {
++			t.Fatalf("accepted truncated input at %d", n)
++		}
++	}
++}
++
++func BenchmarkIPBinaryReadMemory(b *testing.B) {
++	_, data := cidrBinaryFixture(b, 10000)
++	b.ReportAllocs()
++	b.SetBytes(int64(len(data)))
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if _, err := ReadIpCidrSet(bytes.NewReader(data)); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
+diff --git a/component/trie/domain_set_bin.go b/component/trie/domain_set_bin.go
+index 27d15802e0..16ff82c057 100644
+--- a/component/trie/domain_set_bin.go
++++ b/component/trie/domain_set_bin.go
+@@ -63,6 +63,7 @@ func ReadDomainSetBin(r io.Reader) (ds *DomainSet, err error) {
+ 
+ 	ds = &DomainSet{}
+ 	var length int64
++	var word [8]byte
+ 
+ 	// leaves
+ 	err = binary.Read(r, binary.BigEndian, &length)
+@@ -74,10 +75,11 @@ func ReadDomainSetBin(r io.Reader) (ds *DomainSet, err error) {
+ 	}
+ 	ds.leaves = make([]uint64, length)
+ 	for i := int64(0); i < length; i++ {
+-		err = binary.Read(r, binary.BigEndian, &ds.leaves[i])
++		_, err = io.ReadFull(r, word[:])
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		ds.leaves[i] = binary.BigEndian.Uint64(word[:])
+ 	}
+ 
+ 	// labelBitmap
+@@ -90,10 +92,11 @@ func ReadDomainSetBin(r io.Reader) (ds *DomainSet, err error) {
+ 	}
+ 	ds.labelBitmap = make([]uint64, length)
+ 	for i := int64(0); i < length; i++ {
+-		err = binary.Read(r, binary.BigEndian, &ds.labelBitmap[i])
++		_, err = io.ReadFull(r, word[:])
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		ds.labelBitmap[i] = binary.BigEndian.Uint64(word[:])
+ 	}
+ 
+ 	// labels
+diff --git a/component/trie/domain_set_bin_memory_test.go b/component/trie/domain_set_bin_memory_test.go
+new file mode 100644
+index 0000000000..1f790c7680
+--- /dev/null
++++ b/component/trie/domain_set_bin_memory_test.go
+@@ -0,0 +1,77 @@
++package trie
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"testing"
++)
++
++type shortDomainReader struct{ io.Reader }
++
++func (r shortDomainReader) Read(p []byte) (int, error) {
++	if len(p) > 3 {
++		p = p[:3]
++	}
++	return r.Reader.Read(p)
++}
++
++func domainBinaryFixture(tb testing.TB, count int) (*DomainSet, []byte) {
++	tb.Helper()
++	var builder DomainSetBuilder
++	for i := 0; i < count; i++ {
++		if err := builder.Insert(fmt.Sprintf("+.node-%d.example.com", i)); err != nil {
++			tb.Fatal(err)
++		}
++	}
++	set := builder.Build()
++	var buf bytes.Buffer
++	if err := set.WriteBin(&buf); err != nil {
++		tb.Fatal(err)
++	}
++	return set, buf.Bytes()
++}
++
++func TestDomainBinaryMemoryRoundTrip(t *testing.T) {
++	want, data := domainBinaryFixture(t, 12)
++	for _, short := range []bool{false, true} {
++		input := bytes.NewReader(append(append([]byte{}, data...), 0xde, 0xad))
++		var r io.Reader = input
++		if short {
++			r = shortDomainReader{input}
++		}
++		got, err := ReadDomainSetBin(r)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var out bytes.Buffer
++		if err = got.WriteBin(&out); err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(data, out.Bytes()) || input.Len() != 2 {
++			t.Fatal("binary format or reader boundary changed")
++		}
++		for _, host := range []string{"node-3.example.com", "www.node-3.example.com", "node-99.example.com", "example.com"} {
++			if got.Has(host) != want.Has(host) {
++				t.Fatalf("lookup changed: %s", host)
++			}
++		}
++	}
++	for n := 0; n < len(data); n++ {
++		if _, err := ReadDomainSetBin(shortDomainReader{bytes.NewReader(data[:n])}); err == nil {
++			t.Fatalf("accepted truncated input at %d", n)
++		}
++	}
++}
++
++func BenchmarkDomainBinaryReadMemory(b *testing.B) {
++	_, data := domainBinaryFixture(b, 10000)
++	b.ReportAllocs()
++	b.SetBytes(int64(len(data)))
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if _, err := ReadDomainSetBin(bytes.NewReader(data)); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
+diff --git a/rules/provider/mrs_reader.go b/rules/provider/mrs_reader.go
+index 66f62127c8..628cf8acad 100644
+--- a/rules/provider/mrs_reader.go
++++ b/rules/provider/mrs_reader.go
+@@ -14,7 +14,8 @@ var MrsMagicBytes = [4]byte{'M', 'R', 'S', 1} // MRSv1
+ 
+ func rulesMrsParse(buf []byte, strategy ruleStrategy) (ruleStrategy, error) {
+ 	if _strategy, ok := strategy.(mrsRuleStrategy); ok {
+-		reader, err := zstd.NewReader(bytes.NewReader(buf))
++		// Avoid queued decoded blocks while consuming one MRS stream.
++		reader, err := zstd.NewReader(bytes.NewReader(buf), zstd.WithDecoderConcurrency(1))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/rules/provider/mrs_reader_memory_test.go b/rules/provider/mrs_reader_memory_test.go
+new file mode 100644
+index 0000000000..f399f6c876
+--- /dev/null
++++ b/rules/provider/mrs_reader_memory_test.go
+@@ -0,0 +1,131 @@
++package provider
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"net/netip"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++func mrsMemoryFixture(tb testing.TB, count int) ([]byte, []byte) {
++	tb.Helper()
++	strategy := NewDomainStrategy()
++	for i := 0; i < count; i++ {
++		strategy.Insert(fmt.Sprintf("+.node-%d.example.com", i))
++	}
++	strategy.FinishInsert()
++	var raw bytes.Buffer
++	raw.Write(MrsMagicBytes[:])
++	raw.WriteByte(strategy.Behavior().Byte())
++	binary.Write(&raw, binary.BigEndian, int64(strategy.Count()))
++	binary.Write(&raw, binary.BigEndian, int64(0))
++	if err := strategy.WriteMrs(&raw); err != nil {
++		tb.Fatal(err)
++	}
++	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(true))
++	if err != nil {
++		tb.Fatal(err)
++	}
++	defer encoder.Close()
++	return encoder.EncodeAll(raw.Bytes(), nil), raw.Bytes()
++}
++
++func TestMrsMemoryDecoderCompatibility(t *testing.T) {
++	for _, count := range []int{1, 50000} {
++		t.Run(fmt.Sprint(count), func(t *testing.T) {
++			data, raw := mrsMemoryFixture(t, count)
++			got, err := rulesMrsParse(data, NewDomainStrategy())
++			if err != nil {
++				t.Fatal(err)
++			}
++			reference := NewDomainStrategy()
++			if err = reference.FromMrs(bytes.NewReader(raw[21:]), count); err != nil {
++				t.Fatal(err)
++			}
++			if got.Count() != reference.Count() {
++				t.Fatal("count changed")
++			}
++			for _, host := range []string{"node-0.example.com", "www.node-0.example.com", "node-60000.example.com", "example.com"} {
++				metadata := &C.Metadata{Host: host}
++				if got.Match(metadata, C.RuleMatchHelper{}) != reference.Match(metadata, C.RuleMatchHelper{}) {
++					t.Fatalf("lookup changed: %s", host)
++				}
++			}
++			// Last four bytes are the zstd frame checksum. A complete rule payload
++			// must still reject a damaged or truncated frame after synchronous decoding.
++			broken := append([]byte{}, data...)
++			broken[len(broken)-1] ^= 1
++			if _, err = rulesMrsParse(broken, NewDomainStrategy()); err == nil {
++				t.Fatal("accepted invalid zstd checksum")
++			}
++			for _, n := range []int{0, 1, 4, len(data) / 2, len(data) - 4, len(data) - 1} {
++				if _, err = rulesMrsParse(data[:n], NewDomainStrategy()); err == nil {
++					t.Fatalf("accepted truncated frame at %d", n)
++				}
++			}
++		})
++	}
++}
++
++func BenchmarkMrsReadMemory(b *testing.B) {
++	data, _ := mrsMemoryFixture(b, 50000)
++	b.ReportAllocs()
++	b.SetBytes(int64(len(data)))
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if _, err := rulesMrsParse(data, NewDomainStrategy()); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func TestMrsIPMemoryDecoderCompatibility(t *testing.T) {
++	strategy := NewIPCidrStrategy()
++	strategy.Reset()
++	for _, prefix := range []string{"10.0.0.0/24", "192.0.2.0/24", "2001:db8::/32"} {
++		strategy.Insert(prefix)
++	}
++	strategy.FinishInsert()
++	var raw bytes.Buffer
++	raw.Write(MrsMagicBytes[:])
++	raw.WriteByte(strategy.Behavior().Byte())
++	binary.Write(&raw, binary.BigEndian, int64(strategy.Count()))
++	binary.Write(&raw, binary.BigEndian, int64(0))
++	if err := strategy.WriteMrs(&raw); err != nil {
++		t.Fatal(err)
++	}
++	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(true))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer encoder.Close()
++	data := encoder.EncodeAll(raw.Bytes(), nil)
++	got, err := rulesMrsParse(data, NewIPCidrStrategy())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got.Count() != strategy.Count() {
++		t.Fatal("count changed")
++	}
++	for _, ip := range []string{"10.0.0.1", "10.0.1.1", "192.0.2.1", "2001:db8::1", "2001:db9::1"} {
++		metadata := &C.Metadata{DstIP: netip.MustParseAddr(ip)}
++		if got.Match(metadata, C.RuleMatchHelper{}) != strategy.Match(metadata, C.RuleMatchHelper{}) {
++			t.Fatalf("lookup changed: %s", ip)
++		}
++	}
++	broken := append([]byte{}, data...)
++	broken[len(broken)-1] ^= 1
++	if _, err := rulesMrsParse(broken, NewIPCidrStrategy()); err == nil {
++		t.Fatal("accepted invalid zstd checksum")
++	}
++	for _, n := range []int{0, 1, 4, len(data) / 2, len(data) - 4, len(data) - 1} {
++		if _, err := rulesMrsParse(data[:n], NewIPCidrStrategy()); err == nil {
++			t.Fatalf("accepted truncated IP frame at %d", n)
++		}
++	}
++}
+diff --git a/component/trie/domain_set_bin_slim_test.go b/component/trie/domain_set_bin_slim_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/trie/domain_set_bin_slim_test.go
+@@ -0,0 +1,132 @@
++package trie
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"testing"
++)
++
++type slimDomainReader struct {
++	data []byte
++	step int
++	err  error
++}
++
++func (r *slimDomainReader) Read(p []byte) (int, error) {
++	if len(r.data) == 0 {
++		return 0, r.err
++	}
++	if len(p) > r.step {
++		p = p[:r.step]
++	}
++	n := copy(p, r.data)
++	r.data = r.data[n:]
++	if len(r.data) == 0 {
++		return n, r.err
++	}
++	return n, nil
++}
++
++func TestSlimDomainBinaryReadFailures(t *testing.T) {
++	_, data := domainBinaryFixture(t, 65)
++	wantErr := errors.New("injected reader failure")
++	// An I/O failure deserves to survive decoding without a creative rewrite.
++	for cut := 0; cut < len(data); cut++ {
++		got, err := ReadDomainSetBin(&slimDomainReader{data[:cut], 1, wantErr})
++		if got != nil || !errors.Is(err, wantErr) {
++			t.Fatalf("read failure at byte %d was lost: %v", cut, err)
++		}
++	}
++}
++
++func TestSlimDomainBinaryBufferOwnership(t *testing.T) {
++	for _, count := range []int{1, 63, 64, 65, 127, 128, 129, 1024} {
++		t.Run(fmt.Sprint(count), func(t *testing.T) {
++			want, data := domainBinaryFixture(t, count)
++			original := append([]byte(nil), data...)
++			for _, step := range []int{1, 2, 7, 8, 15} {
++				got, err := ReadDomainSetBin(&slimDomainReader{data, step, io.EOF})
++				if err != nil {
++					t.Fatal(err)
++				}
++				for i := 0; i < count; i++ {
++					host := fmt.Sprintf("www.node-%d.example.com", i)
++					if !got.Has(host) || !want.Has(host) {
++						t.Fatalf("known member lost with chunk size %d", step)
++					}
++				}
++				var encoded bytes.Buffer
++				if err := got.WriteBin(&encoded); err != nil || !bytes.Equal(original, encoded.Bytes()) {
++					t.Fatal("word order or binary format changed")
++				}
++				got.leaves[0] ^= 1
++				got.labelBitmap[0] ^= 1
++				got.labels[0] ^= 1
++				if !bytes.Equal(original, data) {
++					t.Fatal("decoded buffers alias the input")
++				}
++			}
++		})
++	}
++}
++
++func TestSlimDomainBinaryAllocationGrowth(t *testing.T) {
++	allocs := func(count int) float64 {
++		_, data := domainBinaryFixture(t, count)
++		return testing.AllocsPerRun(10, func() {
++			if _, err := ReadDomainSetBin(bytes.NewReader(data)); err != nil {
++				t.Fatal(err)
++			}
++		})
++	}
++	small, large := allocs(1), allocs(10000)
++	if large > small+8 {
++		t.Fatalf("allocations scale with rule count: %.0f -> %.0f", small, large)
++	}
++}
++
++func FuzzSlimDomainBinaryRoundTrip(f *testing.F) {
++	f.Add([]byte{0, 1, 63, 64, 127, 255})
++	f.Add([]byte{})
++	f.Fuzz(func(t *testing.T, seed []byte) {
++		if len(seed) > 128 {
++			t.Skip()
++		}
++		var builder DomainSetBuilder
++		if err := builder.Insert("anchor.example.com"); err != nil {
++			t.Fatal(err)
++		}
++		for i, value := range seed {
++			pattern := fmt.Sprintf("node-%d-%d.example.com", i, value)
++			if value&1 != 0 {
++				pattern = "+." + pattern
++			}
++			if err := builder.Insert(pattern); err != nil {
++				t.Fatal(err)
++			}
++		}
++		want := builder.Build()
++		var original bytes.Buffer
++		if err := want.WriteBin(&original); err != nil {
++			t.Fatal(err)
++		}
++		got, err := ReadDomainSetBin(&slimDomainReader{original.Bytes(), 1 + len(seed)%17, io.EOF})
++		if err != nil {
++			t.Fatal(err)
++		}
++		for i, value := range seed {
++			host := fmt.Sprintf("node-%d-%d.example.com", i, value)
++			for _, query := range []string{host, "www." + host, "other." + host} {
++				if got.Has(query) != want.Has(query) {
++					t.Fatal("lookup changed after binary round trip")
++				}
++			}
++		}
++		var encoded bytes.Buffer
++		if err := got.WriteBin(&encoded); err != nil || !bytes.Equal(original.Bytes(), encoded.Bytes()) {
++			t.Fatal("binary representation changed")
++		}
++	})
++}
+diff --git a/component/cidr/ipcidr_set_bin_slim_test.go b/component/cidr/ipcidr_set_bin_slim_test.go
+new file mode 100644
+--- /dev/null
++++ b/component/cidr/ipcidr_set_bin_slim_test.go
+@@ -0,0 +1,97 @@
++package cidr
++
++import (
++	"bytes"
++	"encoding/hex"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++)
++
++type slimIPReader struct {
++	data []byte
++	err  error
++}
++
++func (r *slimIPReader) Read(p []byte) (int, error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++	if len(r.data) == 0 {
++		return 0, r.err
++	}
++	n := copy(p[:1], r.data)
++	r.data = r.data[n:]
++	if len(r.data) == 0 {
++		return n, r.err
++	}
++	return n, nil
++}
++
++func slimIPGolden(t *testing.T) []byte {
++	t.Helper()
++	// Handwritten wire bytes keep the writer out of the witness box.
++	data, err := hex.DecodeString(strings.Join([]string{
++		"010000000000000003",
++		"00000000000000000000ffffc0000201", "00000000000000000000ffffc00002ff",
++		"00000000000000000000ffffc6336400", "00000000000000000000ffffc633647f",
++		"20010db8000000000000000000000001", "20010db80000000000000000000000ff",
++	}, ""))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return data
++}
++
++func TestSlimIPBinaryGoldenAndReadFailures(t *testing.T) {
++	data := slimIPGolden(t)
++	got, err := ReadIpCidrSet(&slimIPReader{data, io.EOF})
++	if err != nil {
++		t.Fatal(err)
++	}
++	queries := []struct {
++		value string
++		want  bool
++	}{
++		{"192.0.2.0", false}, {"192.0.2.1", true}, {"192.0.2.255", true}, {"192.0.3.0", false},
++		{"198.51.100.0", true}, {"198.51.100.127", true}, {"198.51.100.128", false},
++		{"2001:db8::", false}, {"2001:db8::1", true}, {"2001:db8::ff", true}, {"2001:db8::100", false},
++	}
++	for index, query := range queries {
++		if got.IsContainForString(query.value) != query.want {
++			t.Fatalf("golden lookup %d changed", index)
++		}
++	}
++	for index, span := range got.rr {
++		if (index < 2) != span.From().Is4() || (index < 2) != span.To().Is4() {
++			t.Fatal("address family changed")
++		}
++	}
++	var encoded bytes.Buffer
++	if err := got.WriteBin(&encoded); err != nil || !bytes.Equal(data, encoded.Bytes()) {
++		t.Fatal("golden wire representation changed")
++	}
++	wantErr := errors.New("injected reader failure")
++	for cut := 0; cut < len(data); cut++ {
++		result, err := ReadIpCidrSet(&slimIPReader{data[:cut], wantErr})
++		if result != nil || !errors.Is(err, wantErr) {
++			t.Fatalf("read failure at byte %d was lost: %v", cut, err)
++		}
++	}
++}
++
++func TestSlimIPBinaryAllocationGrowth(t *testing.T) {
++	allocs := func(count int) float64 {
++		_, data := cidrBinaryFixture(t, count)
++		return testing.AllocsPerRun(10, func() {
++			if _, err := ReadIpCidrSet(bytes.NewReader(data)); err != nil {
++				t.Fatal(err)
++			}
++		})
++	}
++	small, large := allocs(1), allocs(10000)
++	if large > small+8 {
++		t.Fatalf("allocations scale with range count: %.0f -> %.0f", small, large)
++	}
++}
+diff --git a/rules/provider/mrs_reader_slim_test.go b/rules/provider/mrs_reader_slim_test.go
+new file mode 100644
+--- /dev/null
++++ b/rules/provider/mrs_reader_slim_test.go
+@@ -0,0 +1,170 @@
++package provider
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"net/netip"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++
++	"github.com/klauspost/compress/zstd"
++)
++
++func slimMrsStrategy(tb testing.TB, kind string, count int) mrsRuleStrategy {
++	tb.Helper()
++	var strategy mrsRuleStrategy = NewDomainStrategy()
++	if kind == "ipcidr" {
++		strategy = NewIPCidrStrategy()
++	}
++	strategy.Reset()
++	for index := 0; index < count; index++ {
++		if kind == "ipcidr" {
++			strategy.Insert(fmt.Sprintf("10.%d.%d.0/25", index/256, index%256))
++		} else {
++			strategy.Insert(fmt.Sprintf("+.node-%d.example.com", index))
++		}
++	}
++	if kind == "ipcidr" {
++		strategy.Insert("2001:db8::/64")
++	}
++	strategy.FinishInsert()
++	return strategy
++}
++
++func slimMrsRaw(tb testing.TB, strategy mrsRuleStrategy) []byte {
++	tb.Helper()
++	var raw bytes.Buffer
++	raw.Write(MrsMagicBytes[:])
++	raw.WriteByte(strategy.Behavior().Byte())
++	for _, value := range []int64{int64(strategy.Count()), 3} {
++		if err := binary.Write(&raw, binary.BigEndian, value); err != nil {
++			tb.Fatal(err)
++		}
++	}
++	raw.Write([]byte{0xa1, 0xb2, 0xc3})
++	if err := strategy.WriteMrs(&raw); err != nil {
++		tb.Fatal(err)
++	}
++	return raw.Bytes()
++}
++
++func slimMrsEncode(tb testing.TB, raw []byte, crc bool, window int) []byte {
++	tb.Helper()
++	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderCRC(crc), zstd.WithWindowSize(window))
++	if err != nil {
++		tb.Fatal(err)
++	}
++	defer encoder.Close()
++	return encoder.EncodeAll(raw, nil)
++}
++
++func slimMrsCheck(tb testing.TB, data []byte, kind string, want mrsRuleStrategy) {
++	tb.Helper()
++	var target ruleStrategy = NewDomainStrategy()
++	if kind == "ipcidr" {
++		target = NewIPCidrStrategy()
++	}
++	parsed, err := rulesMrsParse(data, target)
++	if err != nil {
++		tb.Fatal(err)
++	}
++	if parsed.Count() != want.Count() {
++		tb.Fatal("rule count changed")
++	}
++	var original, encoded bytes.Buffer
++	if err := want.WriteMrs(&original); err != nil {
++		tb.Fatal(err)
++	}
++	if err := parsed.(mrsRuleStrategy).WriteMrs(&encoded); err != nil || !bytes.Equal(original.Bytes(), encoded.Bytes()) {
++		tb.Fatal("decoded rule representation changed")
++	}
++	queries := []*C.Metadata{
++		{Host: "node-0.example.com"}, {Host: "www.node-2.example.com"}, {Host: "absent.example.com"},
++		{DstIP: netip.MustParseAddr("10.0.2.1")}, {DstIP: netip.MustParseAddr("10.0.2.128")},
++		{DstIP: netip.MustParseAddr("2001:db8::1")}, {DstIP: netip.MustParseAddr("2001:db8:1::1")},
++	}
++	for _, query := range queries {
++		if parsed.Match(query, C.RuleMatchHelper{}) != want.Match(query, C.RuleMatchHelper{}) {
++			tb.Fatal("decoded lookup changed")
++		}
++	}
++}
++
++func TestSlimMrsFrameVariants(t *testing.T) {
++	for _, kind := range []string{"domain", "ipcidr"} {
++		for _, count := range []int{3, 10000} {
++			kind, count := kind, count
++			t.Run(fmt.Sprintf("%s/%d", kind, count), func(t *testing.T) {
++				t.Parallel()
++				want := slimMrsStrategy(t, kind, count)
++				raw := slimMrsRaw(t, want)
++				for _, window := range []int{1024, 1 << 20} {
++					for _, crc := range []bool{false, true} {
++						data := slimMrsEncode(t, raw, crc, window)
++						slimMrsCheck(t, data, kind, want)
++					}
++				}
++				// Each frame has its own checksum; the decoded MRS spans all three.
++				var framed []byte
++				boundaries := []int{0, 11, len(raw) / 2, len(raw)}
++				for index := 0; index+1 < len(boundaries); index++ {
++					framed = append(framed, slimMrsEncode(t, raw[boundaries[index]:boundaries[index+1]], true, 1024)...)
++				}
++				slimMrsCheck(t, framed, kind, want)
++			})
++		}
++	}
++}
++
++func TestSlimMrsEveryTruncation(t *testing.T) {
++	for _, kind := range []string{"domain", "ipcidr"} {
++		strategy := slimMrsStrategy(t, kind, 3)
++		data := slimMrsEncode(t, slimMrsRaw(t, strategy), true, 1024)
++		newTarget := func() ruleStrategy {
++			if kind == "ipcidr" {
++				return NewIPCidrStrategy()
++			}
++			return NewDomainStrategy()
++		}
++		for cut := 0; cut < len(data); cut++ {
++			if _, err := rulesMrsParse(data[:cut], newTarget()); err == nil {
++				t.Fatalf("%s accepted frame truncated at byte %d", kind, cut)
++			}
++		}
++		for index := len(data) - 4; index < len(data); index++ {
++			damaged := append([]byte(nil), data...)
++			damaged[index] ^= 1
++			if _, err := rulesMrsParse(damaged, newTarget()); err == nil {
++				t.Fatalf("%s accepted checksum corruption at byte %d", kind, index)
++			}
++		}
++	}
++}
++
++func BenchmarkSlimMrsDecode(b *testing.B) {
++	for _, kind := range []string{"domain", "ipcidr"} {
++		kind := kind
++		b.Run(kind, func(b *testing.B) {
++			count := 50000
++			if kind == "ipcidr" {
++				count = 10000
++			}
++			strategy := slimMrsStrategy(b, kind, count)
++			data := slimMrsEncode(b, slimMrsRaw(b, strategy), true, 1<<20)
++			b.ReportAllocs()
++			b.SetBytes(int64(len(data)))
++			b.ResetTimer()
++			for index := 0; index < b.N; index++ {
++				var target ruleStrategy = NewDomainStrategy()
++				if kind == "ipcidr" {
++					target = NewIPCidrStrategy()
++				}
++				if _, err := rulesMrsParse(data, target); err != nil {
++					b.Fatal(err)
++				}
++			}
++		})
++	}
++}
