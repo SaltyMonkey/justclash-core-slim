@@ -1,0 +1,304 @@
+Stop closed HTTP/2 client connections from being retained by their timers.
+
+Source: https://github.com/MetaCubeX/http/pull/2
+Pinned revision: 6a8cb5e86620ff368c58bc7ace9a5622b513098a
+
+Retain the PR's fixes in both the bundled and standalone HTTP/2 clients and its
+original connection-retention regression test. Add source-reference comments
+and deterministic checks in both clients: completing the last stream must arm
+the idle timer on an open connection and leave it stopped on a closed one.
+A closed connection has no use for a timer keeping its buffers as souvenirs.
+
+diff --git a/h2_bundle.go b/h2_bundle.go
+--- a/h2_bundle.go
++++ b/h2_bundle.go
+@@ -9414,7 +9414,11 @@
+ 		panic("forgetting unknown stream id")
+ 	}
+ 	cc.lastActive = time.Now()
+-	if len(cc.streams) == 0 && cc.idleTimer != nil {
++	// Based on https://github.com/MetaCubeX/http/pull/2.
++	// Closed connections do not need souvenir timeouts.
++	// Don't re-arm the idle timer of a closed connection: its callback
++	// keeps cc reachable until the idle timeout fires.
++	if len(cc.streams) == 0 && cc.idleTimer != nil && !cc.closed {
+ 		cc.idleTimer.Reset(cc.idleTimeout)
+ 		cc.lastIdle = time.Now()
+ 	}
+@@ -9497,6 +9501,12 @@
+ 		err = io.ErrUnexpectedEOF
+ 	}
+ 	cc.closed = true
++	// The Stop above runs without cc.mu, so a stream forgotten before closed
++	// was set may have re-armed the idle timer. Stop it again; now that
++	// closed is set, forgetStreamID leaves it alone.
++	if cc.idleTimer != nil {
++		cc.idleTimer.Stop()
++	}
+ 
+ 	// If the connection has never been used, and has been open for only a short time,
+ 	// leave it in the connection pool for a little while.
+@@ -9573,6 +9583,8 @@
+ 	var t *time.Timer
+ 	if readIdleTimeout != 0 {
+ 		t = time.AfterFunc(readIdleTimeout, cc.healthCheck)
++		// The health check holds cc; don't let it outlive the read loop.
++		defer t.Stop()
+ 	}
+ 	for {
+ 		f, err := cc.fr.ReadFrame()
+diff --git a/http2/transport.go b/http2/transport.go
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -2098,7 +2098,11 @@
+ 		panic("forgetting unknown stream id")
+ 	}
+ 	cc.lastActive = time.Now()
+-	if len(cc.streams) == 0 && cc.idleTimer != nil {
++	// Based on https://github.com/MetaCubeX/http/pull/2.
++	// Closed connections do not need souvenir timeouts.
++	// Don't re-arm the idle timer of a closed connection: its callback
++	// keeps cc reachable until the idle timeout fires.
++	if len(cc.streams) == 0 && cc.idleTimer != nil && !cc.closed {
+ 		cc.idleTimer.Reset(cc.idleTimeout)
+ 		cc.lastIdle = time.Now()
+ 	}
+@@ -2181,6 +2185,12 @@
+ 		err = io.ErrUnexpectedEOF
+ 	}
+ 	cc.closed = true
++	// The Stop above runs without cc.mu, so a stream forgotten before closed
++	// was set may have re-armed the idle timer. Stop it again; now that
++	// closed is set, forgetStreamID leaves it alone.
++	if cc.idleTimer != nil {
++		cc.idleTimer.Stop()
++	}
+ 
+ 	// If the connection has never been used, and has been open for only a short time,
+ 	// leave it in the connection pool for a little while.
+@@ -2257,6 +2267,8 @@
+ 	var t *time.Timer
+ 	if readIdleTimeout != 0 {
+ 		t = time.AfterFunc(readIdleTimeout, cc.healthCheck)
++		// The health check holds cc; don't let it outlive the read loop.
++		defer t.Stop()
+ 	}
+ 	for {
+ 		f, err := cc.fr.ReadFrame()
+diff --git a/h2_closed_conn_test.go b/h2_closed_conn_test.go
+new file mode 100644
+--- /dev/null
++++ b/h2_closed_conn_test.go
+@@ -0,0 +1,134 @@
++package http_test
++
++import (
++	"context"
++	"io"
++	"net"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	. "github.com/metacubex/http"
++)
++
++// trackedConn is the raw connection the transport dials. Its finalizer runs
++// once the HTTP/2 client connection that owns it is unreachable.
++type trackedConn struct {
++	net.Conn
++}
++
++// A closed HTTP/2 client connection must not stay reachable from its own
++// timers. The read loop's health-check timer (SendPingTimeout) was reset after
++// every frame but never stopped, and forgetStreamID re-armed the idle timer
++// (IdleConnTimeout) on a connection the read loop had already closed. Both
++// callbacks hold the *ClientConn, and with it the framer, buffers and the
++// underlying net.Conn, until they fire.
++func TestTransportClosedHTTP2ConnNotHeldByTimers(t *testing.T) {
++	run(t, testTransportClosedHTTP2ConnNotHeldByTimers, []testMode{http2Mode})
++}
++
++func testTransportClosedHTTP2ConnNotHeldByTimers(t *testing.T, mode testMode) {
++	// The timers are set long enough that a connection they hold is still
++	// held when the test gives up.
++	const timerPeriod = time.Minute
++	for _, tc := range []struct {
++		name string
++		// ping sets HTTP2Config.SendPingTimeout; idle sets Transport.IdleConnTimeout.
++		ping, idle bool
++		// cutUnderStream closes the connection while a response body is still open,
++		// so the stream is forgotten after the read loop has closed the connection.
++		// Otherwise each response is read to the end and the idle connection is
++		// closed by CloseIdleConnections.
++		cutUnderStream bool
++	}{
++		{name: "no-timers/closed-idle"},
++		{name: "no-timers/cut-under-stream", cutUnderStream: true},
++		{name: "ping/closed-idle", ping: true},
++		{name: "ping/cut-under-stream", ping: true, cutUnderStream: true},
++		{name: "idle/cut-under-stream", idle: true, cutUnderStream: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			release := make(chan struct{})
++			cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
++				w.WriteHeader(200)
++				w.(Flusher).Flush()
++				if r.URL.Path == "/stream" {
++					select {
++					case <-r.Context().Done():
++					case <-release:
++					}
++				}
++			}))
++			defer close(release)
++
++			var live atomic.Int64
++			var mu sync.Mutex
++			var last *trackedConn
++			tr := cst.tr
++			if tc.idle {
++				tr.IdleConnTimeout = timerPeriod
++			}
++			if tc.ping {
++				tr.HTTP2 = &HTTP2Config{SendPingTimeout: timerPeriod}
++			}
++			dial := tr.DialContext
++			if dial == nil {
++				dial = (&net.Dialer{}).DialContext
++			}
++			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++				raw, err := dial(ctx, network, addr)
++				if err != nil {
++					return nil, err
++				}
++				c := &trackedConn{Conn: raw}
++				live.Add(1)
++				runtime.SetFinalizer(c, func(*trackedConn) { live.Add(-1) })
++				mu.Lock()
++				last = c
++				mu.Unlock()
++				return c, nil
++			}
++
++			const conns = 16
++			for i := 0; i < conns; i++ {
++				path := "/"
++				if tc.cutUnderStream {
++					path = "/stream"
++				}
++				res, err := cst.c.Get(cst.ts.URL + path)
++				if err != nil {
++					t.Fatalf("request %d: %v", i, err)
++				}
++				if tc.cutUnderStream {
++					mu.Lock()
++					c := last
++					last = nil
++					mu.Unlock()
++					_ = c.Conn.Close()
++					_, _ = io.Copy(io.Discard, res.Body)
++				} else {
++					_, _ = io.Copy(io.Discard, res.Body)
++				}
++				_ = res.Body.Close()
++				tr.CloseIdleConnections()
++			}
++			mu.Lock()
++			last = nil
++			mu.Unlock()
++
++			// A stopped timer keeps its callback until the runtime drops it from
++			// its heap, which it does lazily; allow a small tail.
++			const allowed = conns / 8
++			deadline := time.Now().Add(3 * time.Second)
++			for live.Load() > allowed && time.Now().Before(deadline) {
++				runtime.GC()
++				time.Sleep(20 * time.Millisecond)
++			}
++			if left := live.Load(); left > allowed {
++				t.Fatalf("%d of %d closed connections still reachable 3s after close (allowed %d)", left, conns, allowed)
++			}
++		})
++	}
++}
+diff --git a/h2_closed_timer_test.go b/h2_closed_timer_test.go
+new file mode 100644
+--- /dev/null
++++ b/h2_closed_timer_test.go
+@@ -0,0 +1,34 @@
++package http
++
++import (
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestHTTP2IdleTimerAfterStreamCompletion(t *testing.T) {
++	for _, closed := range []bool{false, true} {
++		name := "open"
++		if closed {
++			name = "closed"
++		}
++		t.Run(name, func(t *testing.T) {
++			timer := time.AfterFunc(time.Hour, func() {})
++			defer timer.Stop()
++			timer.Stop()
++			cc := &http2ClientConn{
++				t:           &http2Transport{},
++				closed:      closed,
++				streams:     map[uint32]*http2clientStream{1: {}},
++				idleTimer:   timer,
++				idleTimeout: time.Hour,
++			}
++			cc.cond = sync.NewCond(&cc.mu)
++			cc.forgetStreamID(1)
++			active := timer.Stop()
++			if active == closed {
++				t.Fatalf("idle timer active=%v after final stream completion with closed=%v", active, closed)
++			}
++		})
++	}
++}
+diff --git a/http2/closed_timer_test.go b/http2/closed_timer_test.go
+new file mode 100644
+--- /dev/null
++++ b/http2/closed_timer_test.go
+@@ -0,0 +1,34 @@
++package http2
++
++import (
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestClientConnIdleTimerAfterStreamCompletion(t *testing.T) {
++	for _, closed := range []bool{false, true} {
++		name := "open"
++		if closed {
++			name = "closed"
++		}
++		t.Run(name, func(t *testing.T) {
++			timer := time.AfterFunc(time.Hour, func() {})
++			defer timer.Stop()
++			timer.Stop()
++			cc := &ClientConn{
++				t:           &Transport{},
++				closed:      closed,
++				streams:     map[uint32]*clientStream{1: {}},
++				idleTimer:   timer,
++				idleTimeout: time.Hour,
++			}
++			cc.cond = sync.NewCond(&cc.mu)
++			cc.forgetStreamID(1)
++			active := timer.Stop()
++			if active == closed {
++				t.Fatalf("idle timer active=%v after final stream completion with closed=%v", active, closed)
++			}
++		})
++	}
++}
