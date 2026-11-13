@@ -68,6 +68,9 @@ unsupported proxy outside a provider.
 - **URL-test selection:** provider refreshes rebind the selected node to the
   current instance, the first candidate is included, tolerance arithmetic avoids
   overflow, and concurrent selection updates are synchronized.
+- **Fallback selection:** if the saved proxy is absent after a provider refresh,
+  the group uses its first alive proxy and preserves the saved selection for
+  when that proxy returns.
 - **XHTTP compatibility:** corrected path/query handling, default padding and
   selected `sc-*` values for zero ranges, and import of numeric/string ranges
   and download XMUX settings from `extra`.
@@ -82,6 +85,8 @@ unsupported proxy outside a provider.
   attempts instead of immediately retrying the same resource failure.
 - **HTTP/2 memory use:** the request-body scratch-buffer limit is 32 KiB per
   sending stream. This is not a limit on request size or connection throughput.
+  Closed client connections stop their idle and health-check timers, avoiding
+  retention of connection buffers until those timers fire.
 - **MRS loading:** binary readers reuse small buffers, and zstd decoding runs
   synchronously to reduce temporary allocations while loading rule providers.
   The binary format and loaded rule representation are unchanged.
