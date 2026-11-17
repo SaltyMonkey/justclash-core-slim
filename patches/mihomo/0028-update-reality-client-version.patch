@@ -1,0 +1,32 @@
+Advertise Xray 26.11.9 in the REALITY authentication header for minVer testing.
+
+The old hardcoded 1.8.2 can fail server-side minVer checks. Use the version bytes
+from Xray v26.11.9 to test that gate. This changes only the advertised version;
+it does not make mihomo feature-equivalent to that Xray release.
+
+In particular, this client's REALITY verifier still uses Ed25519/HMAC-SHA512
+and does not implement Xray's optional ML-DSA-65 certificate verification
+(mldsa65Verify). Passing minVer does not add that post-quantum authentication
+or establish full compatibility with configurations that require it. Actual
+server requirements and connection behavior must be checked separately.
+
+Reference: https://github.com/XTLS/Xray-core/blob/v26.11.9/core/core.go
+ML-DSA-65: https://github.com/XTLS/Xray-docs-next/blob/main/docs/en/config/transports/reality.md
+
+diff --git a/component/tls/reality.go b/component/tls/reality.go
+--- a/component/tls/reality.go
++++ b/component/tls/reality.go
+@@ -71,9 +71,10 @@
+ 		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
+ 
+ 		copy(hello.SessionId[8:], realityConfig.ShortID[:])
+-		hello.SessionId[0] = 1
+-		hello.SessionId[1] = 8
+-		hello.SessionId[2] = 2
++		// Xray v26.11.9: minVer checks do not share our nostalgia for 1.8.2.
++		hello.SessionId[0] = 26
++		hello.SessionId[1] = 11
++		hello.SessionId[2] = 9
+ 
+ 		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
+ 
