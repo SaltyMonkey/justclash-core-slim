@@ -74,6 +74,12 @@ unsupported proxy outside a provider.
 - **XHTTP compatibility:** corrected path/query handling, default padding and
   selected `sc-*` values for zero ranges, and import of numeric/string ranges
   and download XMUX settings from `extra`.
+- **REALITY version advertisement:** the client advertises `26.11.9` instead of
+  `1.8.2` for testing server-side `minVer` checks. Only the advertised version
+  changes; this does not provide full feature compatibility with Xray `26.11.9`.
+  ML-DSA-65 certificate verification (`mldsa65Verify`) is not implemented.
+  Passing the version check does not add that verification or guarantee a
+  successful connection with the server's configuration.
 - **Controller behavior:** `/memory` reports actual usage from the first message.
   Individual proxy delay tests stop when their API request is cancelled.
   Request headers and TLS handshakes have a 15-second timeout, idle keep-alive
