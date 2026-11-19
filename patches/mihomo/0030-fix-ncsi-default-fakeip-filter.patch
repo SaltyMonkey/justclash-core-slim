@@ -1,0 +1,20 @@
+Correct the Windows NCSI probe hostnames in the default fake-IP filter.
+
+Upstream PR: https://github.com/MetaCubeX/mihomo/pull/3481
+Upstream commit: 39c668d29ab64071ebfb99c04a27c5ecda6f1972
+
+diff --git a/config/config.go b/config/config.go
+index cc8c101670..726ffe93f8 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -529,8 +529,8 @@ func DefaultRawConfig() *RawConfig {
+ 				"tls://223.5.5.5:853",
+ 			},
+ 			FakeIPFilter: []string{
+-				"dns.msftnsci.com",
+-				"www.msftnsci.com",
++				"dns.msftncsi.com",
++				"www.msftncsi.com",
+ 				"www.msftconnecttest.com",
+ 			},
+ 			FakeIPFilterMode: C.FilterBlackList,
