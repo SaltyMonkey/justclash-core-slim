@@ -10,6 +10,9 @@ This avoids the default Batch delay while retaining synchronous persistence.
 Read both state fields from one snapshot. Preserve caches without a shutdown
 checkpoint and skip their occupied addresses on the first new allocation.
 Shutdown no longer writes a stale local cursor over another resolver's progress.
+Defer a range-mismatch flush until the new pool is used so parsing a rejected
+reload leaves the live bucket intact. Adapt upstream PR #3313 to the atomic
+database cursor and legacy checkpoint recovery.
 The bucket names, mapping layout and state keys remain compatible with old cores.
 
 Tests cover rollback, atomic reader snapshots, IPv4/IPv6, legacy checkpoints,
@@ -33,7 +36,24 @@ diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
  )
  
  type store interface {
-@@ -50,9 +50,7 @@
+@@ -37,12 +37,16 @@
+ 	mux     sync.Mutex
+ 	ipnet   netip.Prefix
+ 	store   store
++
++	flushPending bool
+ }
+ 
+ // Lookup return a fake ip with host
+ func (p *Pool) Lookup(host string) netip.Addr {
+ 	p.mux.Lock()
+ 	defer p.mux.Unlock()
++
++	p.flushIfPending()
+ 
+ 	// RFC4343: DNS Case Insensitive, we SHOULD return result with all cases.
+ 	host = strings.ToLower(host)
+@@ -50,9 +54,7 @@
  		return ip
  	}
  
@@ -44,7 +64,46 @@ diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
  }
  
  // LookBack return host with the fake ip
-@@ -110,11 +108,22 @@
+@@ -60,6 +62,8 @@
+ 	p.mux.Lock()
+ 	defer p.mux.Unlock()
+ 
++	p.flushIfPending()
++
+ 	return p.store.GetByIP(ip)
+ }
+ 
+@@ -67,6 +71,8 @@
+ func (p *Pool) Exist(ip netip.Addr) bool {
+ 	p.mux.Lock()
+ 	defer p.mux.Unlock()
++
++	p.flushIfPending()
+ 
+ 	return p.store.Exist(ip)
+ }
+@@ -94,11 +100,20 @@
+ 	o.mux.Lock()
+ 	defer o.mux.Unlock()
+ 
++	// Settle the old pool's pending reset before late lookups can reach it.
++	o.flushIfPending()
+ 	o.store.CloneTo(p.store)
+ 
+ 	// the allocation state only matches the cloned entries if both pools cover the same range
+ 	if o.first == p.first && o.last == p.last {
+ 		p.offset, p.cycle = o.offset, o.cycle
++
++		current, currentPersistent := p.store.(*cachefileStore)
++		previous, previousPersistent := o.store.(*cachefileStore)
++		if currentPersistent && previousPersistent && current.cache.DB == previous.cache.DB {
++			// The active pool has already reconciled the shared bucket for this range.
++			p.flushPending = false
++		}
+ 	}
+ }
+ 
+@@ -110,47 +125,67 @@
  		p.offset = p.first
  	}
  
@@ -67,7 +126,19 @@ diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
  	return p.offset
  }
  
-@@ -127,30 +136,22 @@
+ func (p *Pool) FlushFakeIP() error {
++	p.mux.Lock()
++	defer p.mux.Unlock()
++	return p.flushFakeIPLocked()
++}
++
++func (p *Pool) flushFakeIPLocked() error {
+ 	err := p.store.FlushFakeIP()
+ 	if err == nil {
++		p.flushPending = false
+ 		p.cycle = false
+ 		p.offset = p.first.Prev()
+ 	}
  	return err
  }
  
@@ -79,6 +150,14 @@ diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
 -		}
 -	}
 -}
++// flushIfPending runs under the pool lock, once the candidate pool starts serving.
++func (p *Pool) flushIfPending() {
++	if p.flushPending {
++		p.flushPending = false
++		_ = p.flushFakeIPLocked()
++	}
++}
++
 +// StoreState is retained for shutdown callers. Persistent allocation now commits
 +// its cursor and cycle marker with every mapping, so no checkpoint is left to save.
 +func (p *Pool) StoreState() {}
@@ -87,20 +166,26 @@ diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
  	if s, ok := p.store.(*cachefileStore); ok {
 -		if _, exist := s.GetByHost(cycleKey); exist {
 -			p.cycle = true
--		}
--
--		if offset, exist := s.GetByHost(offsetKey); exist {
 +		offset, cycle := s.State()
 +		if offset.IsValid() {
- 			if p.ipnet.Contains(offset) {
--				p.offset = offset
++			if p.ipnet.Contains(offset) {
 +				p.offset, p.cycle = offset, cycle
- 			} else {
- 				_ = p.FlushFakeIP()
- 			}
++			} else {
++				// The candidate config can still be rejected. The running pool may
++				// be using this very bucket until a replacement starts serving.
++				p.flushPending = true
++			}
+ 		}
+-
+-		if offset, exist := s.GetByHost(offsetKey); exist {
+-			if p.ipnet.Contains(offset) {
+-				p.offset = offset
+-			} else {
+-				_ = p.FlushFakeIP()
+-			}
 -		} else if s.Exist(p.first) {
 -			_ = p.FlushFakeIP()
- 		}
+-		}
 +		// No checkpoint is not a request to erase the records. Allocate skips occupied
 +		// addresses and commits the recovered position with the first new mapping.
  	}
@@ -494,7 +579,7 @@ diff --git a/component/fakeip/persistence_test.go b/component/fakeip/persistence
 new file mode 100644
 --- /dev/null
 +++ b/component/fakeip/persistence_test.go
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,410 @@
 +package fakeip
 +
 +import (
@@ -717,6 +802,58 @@ new file mode 100644
 +	address := reloaded.Lookup("synthetic-after-old-shutdown")
 +	if seen[address] {
 +		t.Fatal("old shutdown rewound the allocation cursor")
++	}
++}
++
++func TestPersistentFakeIPRangeReloadDefersFlush(t *testing.T) {
++	oldRange := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 16)
++	newRange := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 19}), 16)
++	const oldHost = "synthetic-before-range-change"
++
++	for _, operation := range []string{"lookup", "lookback", "exist"} {
++		t.Run(operation, func(t *testing.T) {
++			db, err := bbolt.Open(filepath.Join(t.TempDir(), "synthetic.db"), 0o600, &bbolt.Options{NoStatistics: true})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer db.Close()
++
++			old := persistentTestPool(t, db, oldRange)
++			saved := old.Lookup(oldHost)
++			reloaded := persistentTestPool(t, db, newRange)
++			if got, ok := old.LookBack(saved); !ok || got != oldHost {
++				t.Fatal("building an unapplied pool erased the live mapping")
++			}
++			if offset, _ := old.store.(*cachefileStore).State(); offset != saved {
++				t.Fatal("building an unapplied pool erased the live cursor")
++			}
++
++			reloaded.CloneFrom(old)
++			if got, ok := old.LookBack(saved); !ok || got != oldHost {
++				t.Fatal("cloning erased the live mapping before the new pool was used")
++			}
++
++			switch operation {
++			case "lookup":
++				if got := reloaded.Lookup(oldHost); !newRange.Contains(got) {
++					t.Fatal("lookup returned an address outside the new range")
++				}
++			case "lookback":
++				if _, ok := reloaded.LookBack(saved); ok {
++					t.Fatal("reverse lookup exposed a mapping from the old range")
++				}
++			case "exist":
++				if reloaded.Exist(saved) {
++					t.Fatal("exist exposed a mapping from the old range")
++				}
++			}
++			if _, ok := old.LookBack(saved); ok {
++				t.Fatal("the old mapping survived the new pool's first use")
++			}
++			if got := reloaded.Lookup("synthetic-after-range-change"); !newRange.Contains(got) {
++				t.Fatal("allocation did not use the new range")
++			}
++		})
 +	}
 +}
 +
