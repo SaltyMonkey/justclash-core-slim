@@ -1,0 +1,657 @@
+Skip DEBUG event formatting when neither the terminal nor log subscribers need it.
+
+Upstream PR: https://github.com/MetaCubeX/mihomo/pull/3430
+Upstream commit: c369a9890d685bceca65106b740e568d96aaebc0
+
+diff --git a/dns/client.go b/dns/client.go
+index 6362fe7eb9..f100833029 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -63,7 +63,9 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error)
+ 		// Resolvers MUST resend queries over TCP if they receive a truncated UDP response (with TC=1 set)!
+ 		if msg != nil && msg.Truncated && network == "udp" {
+ 			network = "tcp"
+-			log.Debugln("[DNS] Truncated reply from %s:%s for %s over UDP, retrying over TCP", c.host, c.port, m.Question[0].String())
++			if log.DebugEnabled() {
++				log.Debugln("[DNS] Truncated reply from %s:%s for %s over UDP, retrying over TCP", c.host, c.port, m.Question[0].String())
++			}
+ 			var tcpConn net.Conn
+ 			tcpConn, err = c.dialer.DialContext(ctx, network, addr)
+ 			if err != nil {
+diff --git a/dns/doh.go b/dns/doh.go
+index b56d8ffd45..5b2432aff5 100644
+--- a/dns/doh.go
++++ b/dns/doh.go
+@@ -36,9 +36,9 @@ const (
+ 	// connections in HTTP transport.
+ 	transportDefaultIdleConnTimeout = 5 * time.Minute
+ 
+-	dialTimeout        = 10 * time.Second
++	dialTimeout = 10 * time.Second
+ 
+-	maxElapsedTime  = time.Second * 30
++	maxElapsedTime = time.Second * 30
+ )
+ 
+ var DefaultHTTPVersions = []C.HTTPVersion{C.HTTPVersion11, C.HTTPVersion2}
+@@ -424,12 +424,16 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
+ 		// upstream.
+ 		transportH3, err := doh.createTransportH3(ctx, tlsConfig)
+ 		if err == nil {
+-			log.Debugln("[%s] using HTTP/3 for this upstream: QUIC was faster", doh.url.String())
++			if log.DebugEnabled() {
++				log.Debugln("[%s] using HTTP/3 for this upstream: QUIC was faster", doh.url.String())
++			}
+ 			return transportH3, nil
+ 		}
+ 	}
+ 
+-	log.Debugln("[%s] using HTTP/2 for this upstream: %v", doh.url.String(), err)
++	if log.DebugEnabled() {
++		log.Debugln("[%s] using HTTP/2 for this upstream: %v", doh.url.String(), err)
++	}
+ 
+ 	if !doh.supportsHTTP() {
+ 		return nil, errors.New("HTTP1/1 and HTTP2 are not supported by this upstream")
+diff --git a/dns/middleware.go b/dns/middleware.go
+index fa6cb68ba0..0ecb424317 100644
+--- a/dns/middleware.go
++++ b/dns/middleware.go
+@@ -209,7 +209,9 @@ func withResolver(resolver resolver.Resolver, ipv6 bool) handler {
+ 
+ 		msg, err := resolver.ExchangeContext(ctx, r)
+ 		if err != nil {
+-			log.Debugln("[DNS Server] Exchange %s failed: %v", q.String(), err)
++			if log.DebugEnabled() {
++				log.Debugln("[DNS Server] Exchange %s failed: %v", q.String(), err)
++			}
+ 			return msg, err
+ 		}
+ 		msg.SetRcode(r, msg.Rcode)
+diff --git a/dns/resolver.go b/dns/resolver.go
+index b8742f244c..4c7e720917 100644
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -165,10 +165,11 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+ 	}()
+ 
+ 	q := m.Question[0]
+-	domain := msgToDomain(m)
+ 	msg, expireTime, hit := getMsgFromCache(r.cache, q)
+ 	if hit {
+-		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
++		if log.DebugEnabled() {
++			log.Debugln("[DNS] cache hit %s --> %s, expire at %s", msgToDomain(m), msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
++		}
+ 		now := time.Now()
+ 		if expireTime.Before(now) {
+ 			setMsgTTL(msg, uint32(1)) // Continue fetch
+diff --git a/dns/util.go b/dns/util.go
+index 0a0c6e48a0..21126f5180 100644
+--- a/dns/util.go
++++ b/dns/util.go
+@@ -281,7 +281,9 @@ func wrapClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient
+ 	}
+ 
+ 	if ecsPrefix.IsValid() {
+-		log.Debugln("DNS [%s] config with ecs: %s", c.Address(), ecsPrefix)
++		if log.DebugEnabled() {
++			log.Debugln("DNS [%s] config with ecs: %s", c.Address(), ecsPrefix)
++		}
+ 		if params["ecs-override"] == "true" {
+ 			ecsOverride = true
+ 		}
+@@ -425,7 +427,9 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
+ 		}
+ 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop
+ 		fast.Go(func() (*D.Msg, error) {
+-			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
++			if log.DebugEnabled() {
++				log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
++			}
+ 			m, err := client.ExchangeContext(ctx, m)
+ 			if err != nil {
+ 				return nil, err
+@@ -434,7 +438,9 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
+ 				// so we would ignore RCode errors from RCode clients.
+ 				return nil, errors.New("server failure: " + D.RcodeToString[m.Rcode])
+ 			}
+-			log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
++			if log.DebugEnabled() {
++				log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
++			}
+ 			return m, nil
+ 		})
+ 	}
+diff --git a/hub/route/log_interest_test.go b/hub/route/log_interest_test.go
+new file mode 100644
+index 0000000000..8e4df409eb
+--- /dev/null
++++ b/hub/route/log_interest_test.go
+@@ -0,0 +1,92 @@
++package route
++
++import (
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++	"github.com/metacubex/mihomo/log"
++)
++
++type failedLogWriter struct {
++	header  http.Header
++	payload string
++	debug   bool
++}
++
++func (w *failedLogWriter) Header() http.Header { return w.header }
++func (w *failedLogWriter) WriteHeader(int)     {}
++func (w *failedLogWriter) Flush()              {}
++func (w *failedLogWriter) Write(p []byte) (int, error) {
++	w.payload = string(p)
++	w.debug = log.DebugEnabled()
++	return 0, errors.New("synthetic disconnect")
++}
++
++func TestLogAPIInterestCleanup(t *testing.T) {
++	old := log.Level()
++	log.SetLevel(log.ERROR)
++	defer log.SetLevel(old)
++	for _, format := range []string{"", "&format=structured"} {
++		w := &failedLogWriter{header: make(http.Header)}
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			getLogs(w, httptest.NewRequest("GET", "http://localhost/logs?level=debug"+format, nil))
++		}()
++		deadline := time.Now().Add(time.Second)
++		for !log.DebugEnabled() && time.Now().Before(deadline) {
++			time.Sleep(time.Millisecond)
++		}
++		if !log.DebugEnabled() {
++			t.Fatal("API did not declare DEBUG interest")
++		}
++		log.Debugln("interest-test")
++		select {
++		case <-done:
++		case <-time.After(time.Second):
++			t.Fatal("write failure did not finish log handler")
++		}
++		if log.DebugEnabled() || !strings.Contains(w.payload, "interest-test") {
++			t.Fatal("DEBUG interest or payload incorrect", w.payload)
++		}
++	}
++	info := &failedLogWriter{header: make(http.Header)}
++	finished := make(chan struct{})
++	go func() {
++		defer close(finished)
++		getLogs(info, httptest.NewRequest("GET", "http://localhost/logs?level=info", nil))
++	}()
++	timeout := time.NewTimer(time.Second)
++	defer timeout.Stop()
++	tick := time.NewTicker(time.Millisecond)
++	defer tick.Stop()
++waiting:
++	for {
++		select {
++		case <-finished:
++			break waiting
++		case <-tick.C:
++			log.Infoln("info-interest-test")
++		case <-timeout.C:
++			t.Fatal("INFO handler did not observe write failure")
++		}
++	}
++	if info.debug || !strings.Contains(info.payload, "info-interest-test") {
++		t.Fatal("INFO API enabled DEBUG or lost INFO", info.payload)
++	}
++	invalid := httptest.NewRecorder()
++	getLogs(invalid, httptest.NewRequest("GET", "http://localhost/logs?level=invalid", nil))
++	if invalid.Code != http.StatusBadRequest || log.DebugEnabled() {
++		t.Fatal("invalid request registered interest")
++	}
++	request := httptest.NewRequest("GET", "http://localhost/logs?level=debug", nil)
++	request.Header.Set("Upgrade", "websocket")
++	getLogs(httptest.NewRecorder(), request)
++	if log.DebugEnabled() {
++		t.Fatal("failed upgrade registered interest")
++	}
++}
+diff --git a/hub/route/server.go b/hub/route/server.go
+index 6d37d4802b..a67982eab2 100644
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -513,7 +513,7 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	ch := make(chan log.Event, 1024)
+-	sub := log.Subscribe()
++	sub := log.SubscribeLevel(level)
+ 	defer log.UnSubscribe(sub)
+ 	buf := &bytes.Buffer{}
+ 
+diff --git a/log/debug_bench_test.go b/log/debug_bench_test.go
+new file mode 100644
+index 0000000000..3ab2a8f440
+--- /dev/null
++++ b/log/debug_bench_test.go
+@@ -0,0 +1,56 @@
++package log
++
++import (
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestDebugSubscription(t *testing.T) {
++	old := Level()
++	SetLevel(INFO)
++	defer SetLevel(old)
++	sub := Subscribe()
++	defer UnSubscribe(sub)
++	Debugln("test-debug-%d", 1)
++	select {
++	case event := <-sub:
++		if event.LogLevel != DEBUG || event.Payload != "test-debug-1" {
++			t.Fatalf("debug subscription changed: %#v", event)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("terminal INFO suppressed a subscribed DEBUG event")
++	}
++}
++
++func BenchmarkDebug(b *testing.B) {
++	old := Level()
++	SetLevel(INFO)
++	defer SetLevel(old)
++	for _, subscribed := range []bool{false, true} {
++		name := "no-subscriber"
++		if subscribed {
++			name = "debug-subscriber"
++		}
++		b.Run(name, func(b *testing.B) {
++			var finish func()
++			if subscribed {
++				sub := Subscribe()
++				var wg sync.WaitGroup
++				wg.Add(1)
++				go func() {
++					defer wg.Done()
++					for range sub {
++					}
++				}()
++				finish = func() { UnSubscribe(sub); wg.Wait() }
++				defer finish()
++			}
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				Debugln("[DNS] cache hit %s --> %s, expire at %s", "matrix.invalid.", "198.18.0.1", "2030-01-01 00:00:00")
++			}
++		})
++	}
++}
+diff --git a/log/debug_interest_test.go b/log/debug_interest_test.go
+new file mode 100644
+index 0000000000..290cf1225a
+--- /dev/null
++++ b/log/debug_interest_test.go
+@@ -0,0 +1,88 @@
++package log
++
++import (
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type debugStringer struct{ calls *atomic.Int64 }
++
++func (s debugStringer) String() string { s.calls.Add(1); return "formatted" }
++
++func TestDebugInterest(t *testing.T) {
++	old := Level()
++	SetLevel(INFO)
++	defer SetLevel(old)
++	calls := new(atomic.Int64)
++	value := debugStringer{calls}
++	Debugln("%s", value)
++	SingLogger.Debug(value)
++	SingInfoToDebugLogger.Info(value)
++	if calls.Load() != 0 || DebugEnabled() {
++		t.Fatal("unused DEBUG was formatted")
++	}
++	info := SubscribeLevel(INFO)
++	defer UnSubscribe(info)
++	Debugln("%s", value)
++	if calls.Load() != 0 || DebugEnabled() {
++		t.Fatal("INFO subscription enabled DEBUG")
++	}
++	debug := Subscribe()
++	defer UnSubscribe(debug)
++	Debugln("%s", value)
++	select {
++	case event := <-debug:
++		if event.Payload != "formatted" || event.LogLevel != DEBUG {
++			t.Fatal(event)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("DEBUG subscriber lost event")
++	}
++	if calls.Load() != 1 {
++		t.Fatal("DEBUG payload not formatted once", calls.Load())
++	}
++	SetLevel(DEBUG)
++	UnSubscribe(debug)
++	UnSubscribe(debug)
++	if !DebugEnabled() {
++		t.Fatal("terminal DEBUG lost interest during handoff")
++	}
++	SetLevel(INFO)
++	if DebugEnabled() {
++		t.Fatal("last DEBUG interest retained")
++	}
++	UnSubscribe(info)
++}
++
++func TestDebugInterestConcurrent(t *testing.T) {
++	old := Level()
++	SetLevel(DEBUG)
++	defer SetLevel(old)
++	// Each writer transfers interest with overlap. There is continuously at least
++	// one receiver; the aggregate guard must never briefly publish false.
++	var wg sync.WaitGroup
++	var stop atomic.Bool
++	var missing atomic.Bool
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for !stop.Load() {
++			if !DebugEnabled() {
++				missing.Store(true)
++			}
++		}
++	}()
++	for i := 0; i < 1000; i++ {
++		sub := SubscribeLevel(DEBUG)
++		SetLevel(INFO)
++		SetLevel(DEBUG)
++		UnSubscribe(sub)
++	}
++	stop.Store(true)
++	wg.Wait()
++	if missing.Load() {
++		t.Fatal("DEBUG interest vanished during an overlapping handoff")
++	}
++}
+diff --git a/log/debug_slow_test.go b/log/debug_slow_test.go
+new file mode 100644
+index 0000000000..761a4637fd
+--- /dev/null
++++ b/log/debug_slow_test.go
+@@ -0,0 +1,94 @@
++package log
++
++import (
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestLevelChangeWithSaturatedSubscriber(t *testing.T) {
++	old := Level()
++	SetLevel(ERROR)
++	sub := Subscribe()
++	producerDone, unsubDone := make(chan struct{}), make(chan struct{})
++	var changed chan struct{}
++	unsubStarted := false
++	wait := func(ch <-chan struct{}, name string) {
++		select {
++		case <-ch:
++		case <-time.After(time.Second):
++			t.Error(name + " did not settle")
++		}
++	}
++	// Draining is required by the existing blocking observable contract. Wait
++	// for every writer before restoring the package's global level, even on failure.
++	defer func() {
++		go func() {
++			for range sub {
++			}
++		}()
++		if !unsubStarted {
++			go func() { UnSubscribe(sub); close(unsubDone) }()
++		}
++		wait(producerDone, "producer")
++		wait(unsubDone, "unsubscribe")
++		if changed != nil {
++			wait(changed, "level writer")
++		}
++		SetLevel(old)
++	}()
++	for i := 0; i < cap(sub); i++ {
++		Infoln("fill")
++	}
++	first := make(chan struct{})
++	go func() { Infoln("overflow"); close(first); Infoln("pending"); close(producerDone) }()
++	select {
++	case <-first:
++	case <-time.After(time.Second):
++		t.Fatal("overflow not received")
++	}
++	// Receiving the overflow event alone does not prove process has acquired its
++	// mutex. Observe the actual blocked broadcast before starting the unregister.
++	// There is one observable in this package; process sends only inside Emit.
++	deadline := time.Now().Add(time.Second)
++	blocked := false
++	for time.Now().Before(deadline) {
++		buffer := make([]byte, 64<<10)
++		n := runtime.Stack(buffer, true)
++		for _, stack := range strings.Split(string(buffer[:n]), "\n\n") {
++			if strings.Contains(stack, "[chan send]") && strings.Contains(stack, "common/observable.(*Observable[") && strings.Contains(stack, ").process(") {
++				blocked = true
++				break
++			}
++		}
++		if blocked {
++			break
++		}
++		runtime.Gosched()
++	}
++	if !blocked {
++		t.Fatal("did not reach blocked observable delivery")
++	}
++	unsubStarted = true
++	go func() { UnSubscribe(sub); close(unsubDone) }()
++	deadline = time.Now().Add(time.Second)
++	for DebugEnabled() && time.Now().Before(deadline) {
++		time.Sleep(time.Millisecond)
++	}
++	if DebugEnabled() {
++		t.Fatal("unsubscribe did not withdraw interest")
++	}
++	select {
++	case <-unsubDone:
++		t.Fatal("unsubscribe unexpectedly bypassed blocked delivery")
++	default:
++	}
++	changed = make(chan struct{})
++	go func() { SetLevel(DEBUG); close(changed) }()
++	select {
++	case <-changed:
++	case <-time.After(time.Second):
++		t.Fatal("observable backpressure held the level writer lock")
++	}
++}
+diff --git a/log/log.go b/log/log.go
+index f1c68b4270..1fa59c66e2 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -3,6 +3,8 @@ package log
+ import (
+ 	"fmt"
+ 	"os"
++	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/metacubex/mihomo/common/observable"
+ 
+@@ -10,12 +12,16 @@ import (
+ )
+ 
+ var (
+-	logCh  = make(chan Event)
+-	source = observable.NewObservable[Event](logCh)
+-	level  = INFO
++	logCh            = make(chan Event)
++	source           = observable.NewObservable[Event](logCh)
++	level            atomic.Int32
++	debugEnabled     atomic.Bool
++	interestMu       sync.Mutex
++	debugSubscribers = make(map[observable.Subscription[Event]]struct{})
+ )
+ 
+ func init() {
++	level.Store(int32(INFO))
+ 	log.SetOutput(os.Stdout)
+ 	log.SetLevel(log.DebugLevel)
+ 	log.SetFormatter(&log.TextFormatter{
+@@ -52,7 +58,15 @@ func Errorln(format string, v ...any) {
+ 	print(event)
+ }
+ 
++// DebugEnabled reports whether the terminal or a subscriber needs DEBUG events.
++func DebugEnabled() bool {
++	return debugEnabled.Load()
++}
++
+ func Debugln(format string, v ...any) {
++	if !DebugEnabled() {
++		return
++	}
+ 	event := newLog(DEBUG, format, v...)
+ 	logCh <- event
+ 	print(event)
+@@ -62,25 +76,53 @@ func Fatalln(format string, v ...any) {
+ 	log.Fatalf(format, v...)
+ }
+ 
++// Subscribe retains the unfiltered subscription's DEBUG interest.
+ func Subscribe() observable.Subscription[Event] {
+-	sub, _ := source.Subscribe()
++	return SubscribeLevel(DEBUG)
++}
++
++// SubscribeLevel declares the lowest level a consumer needs. Events remain
++// multicast; consumers must still filter events below their requested level.
++func SubscribeLevel(minLevel LogLevel) observable.Subscription[Event] {
++	sub, err := source.Subscribe()
++	if err == nil && minLevel <= DEBUG {
++		interestMu.Lock()
++		debugSubscribers[sub] = struct{}{}
++		updateDebugEnabled()
++		interestMu.Unlock()
++	}
+ 	return sub
+ }
+ 
+ func UnSubscribe(sub observable.Subscription[Event]) {
++	interestMu.Lock()
++	delete(debugSubscribers, sub)
++	updateDebugEnabled()
++	interestMu.Unlock()
++	// Observable operations can wait for slow consumers. Do not hold the
++	// interest writer lock while waiting, which would also block SetLevel.
+ 	source.UnSubscribe(sub)
+ }
+ 
+ func Level() LogLevel {
+-	return level
++	return LogLevel(level.Load())
+ }
+ 
+ func SetLevel(newLevel LogLevel) {
+-	level = newLevel
++	interestMu.Lock()
++	defer interestMu.Unlock()
++	level.Store(int32(newLevel))
++	updateDebugEnabled()
++}
++
++// Called under interestMu so a terminal/subscriber handoff cannot publish a
++// transient false value while DEBUG is continuously needed.
++func updateDebugEnabled() {
++	debugEnabled.Store(Level() <= DEBUG || len(debugSubscribers) != 0)
+ }
+ 
+ func print(data Event) {
+-	if data.LogLevel < level {
++	if data.LogLevel < Level() {
+ 		return
+ 	}
+ 
+diff --git a/log/sing.go b/log/sing.go
+index 854b7b874a..24861cf79e 100644
+--- a/log/sing.go
++++ b/log/sing.go
+@@ -10,11 +10,15 @@ import (
+ type singLogger struct{}
+ 
+ func (l singLogger) TraceContext(ctx context.Context, args ...any) {
+-	Debugln(fmt.Sprint(args...))
++	if DebugEnabled() {
++		Debugln(fmt.Sprint(args...))
++	}
+ }
+ 
+ func (l singLogger) DebugContext(ctx context.Context, args ...any) {
+-	Debugln(fmt.Sprint(args...))
++	if DebugEnabled() {
++		Debugln(fmt.Sprint(args...))
++	}
+ }
+ 
+ func (l singLogger) InfoContext(ctx context.Context, args ...any) {
+@@ -38,11 +42,15 @@ func (l singLogger) PanicContext(ctx context.Context, args ...any) {
+ }
+ 
+ func (l singLogger) Trace(args ...any) {
+-	Debugln(fmt.Sprint(args...))
++	if DebugEnabled() {
++		Debugln(fmt.Sprint(args...))
++	}
+ }
+ 
+ func (l singLogger) Debug(args ...any) {
+-	Debugln(fmt.Sprint(args...))
++	if DebugEnabled() {
++		Debugln(fmt.Sprint(args...))
++	}
+ }
+ 
+ func (l singLogger) Info(args ...any) {
+@@ -70,11 +78,15 @@ type singInfoToDebugLogger struct {
+ }
+ 
+ func (l singInfoToDebugLogger) InfoContext(ctx context.Context, args ...any) {
+-	Debugln(fmt.Sprint(args...))
++	if DebugEnabled() {
++		Debugln(fmt.Sprint(args...))
++	}
+ }
+ 
+ func (l singInfoToDebugLogger) Info(args ...any) {
+-	Debugln(fmt.Sprint(args...))
++	if DebugEnabled() {
++		Debugln(fmt.Sprint(args...))
++	}
+ }
+ 
+ var SingLogger L.ContextLogger = singLogger{}
