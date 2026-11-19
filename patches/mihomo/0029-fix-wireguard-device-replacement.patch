@@ -1,0 +1,304 @@
+Close the previous WireGuard device before its replacement starts.
+
+Upstream PR: https://github.com/MetaCubeX/mihomo/pull/3271
+Upstream commit: 6b3b99b1d4926f2c0ddaa1570683b8956c1410ea
+
+Downstream: wait for overlapping replacements to finish tearing down their
+predecessors before bringing up the latest device.
+
+diff --git a/adapter/outbound/wireguard.go b/adapter/outbound/wireguard.go
+--- a/adapter/outbound/wireguard.go
++++ b/adapter/outbound/wireguard.go
+@@ -42,6 +42,14 @@
+ 	ipStackMips   = "mips"
+ )
+ 
++var (
++	wireGuardSerial       atomic.Uint64
++	wireGuardDevicesMutex sync.Mutex
++	wireGuardDevices      = make(map[string]*WireGuard) // deviceKey -> outbound running that device
++
++	errWireGuardOutdated = errors.New("wireguard device is running in a newer outbound")
++)
++
+ type wireguardGoDevice interface {
+ 	Close()
+ 	IpcSet(uapiConf string) error
+@@ -54,6 +62,7 @@
+ 	tunDevice wireguardDevice
+ 	resolver  resolver.Resolver
+ 
++	serial        uint64 // creation order, a newer outbound takes over the device of an older one
+ 	runCtx        context.Context
+ 	runCancel     context.CancelFunc
+ 	deviceMutex   sync.Mutex
+@@ -363,6 +372,7 @@
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
+ 		}),
++		serial: wireGuardSerial.Add(1),
+ 	}
+ 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+ 	singDialer := proxydialer.NewSingDialer(proxydialer.NewSlowDownDialer(outbound.dialer, slowdown.New()))
+@@ -542,6 +552,12 @@
+ 	if err = ctx.Err(); err != nil {
+ 		return err
+ 	}
++	if err = w.takeOverDevice(); err != nil {
++		return err
++	}
++	if err = w.runCtx.Err(); err != nil {
++		return err
++	}
+ 
+ 	stack, err := newIPStack(w.option.IPStack, w.localPrefixes, uint32(w.option.MTU))
+ 	if err != nil {
+@@ -603,6 +619,52 @@
+ 	}
+ 	w.device, w.tunDevice = wgDevice, tunDevice
+ 	w.initOk.Store(true)
++	return nil
++}
++
++// deviceKey identifies the proxy this outbound belongs to and the device it runs,
++// as seen by the peer: the private key, and the public key and endpoint of each peer.
++func (w *WireGuard) deviceKey() string {
++	key := w.option.ProviderName + "\x00" + w.option.Name + "\x00" + w.option.PrivateKey
++	if len(w.option.Peers) > 0 {
++		for _, peer := range w.option.Peers {
++			key += "\x00" + peer.PublicKey + "@" + peer.Addr().String()
++		}
++	} else {
++		key += "\x00" + w.option.PublicKey + "@" + w.option.Addr().String()
++	}
++	return key
++}
++
++// takeOverDevice must be called before the device is brought up.
++// A config reload or provider update replaces the outbound, but the old one is only
++// closed by the GC, which can take minutes and doesn't happen at all while a connection
++// still uses it. Two devices with the same private key make the peer switch its endpoint
++// between them, so the newer outbound closes the older one's device first.
++func (w *WireGuard) takeOverDevice() error {
++	key := w.deviceKey()
++	wireGuardDevicesMutex.Lock()
++	if err := w.runCtx.Err(); err != nil {
++		wireGuardDevicesMutex.Unlock()
++		return err
++	}
++	old := wireGuardDevices[key]
++	if old != nil && old.serial > w.serial {
++		wireGuardDevicesMutex.Unlock()
++		return errWireGuardOutdated
++	}
++	wireGuardDevices[key] = w
++	wireGuardDevicesMutex.Unlock()
++
++	if old != nil && old != w {
++		log.Debugln("[WG](%s) closing the device of the outdated outbound", w.option.Name)
++		old.runCancel()
++		// The previous init may still be closing its own predecessor.
++		// Wait for that teardown before starting another device.
++		old.initMutex.Lock()
++		_ = old.Close()
++		old.initMutex.Unlock()
++	}
+ 	return nil
+ }
+ 
+@@ -805,6 +867,11 @@
+ // Close implements C.ProxyAdapter
+ func (w *WireGuard) Close() error {
+ 	w.runCancel()
++	wireGuardDevicesMutex.Lock()
++	if key := w.deviceKey(); wireGuardDevices[key] == w {
++		delete(wireGuardDevices, key)
++	}
++	wireGuardDevicesMutex.Unlock()
+ 	w.deviceMutex.Lock()
+ 	wgDevice := w.device
+ 	w.deviceMutex.Unlock()
+diff --git a/adapter/outbound/wireguard_test.go b/adapter/outbound/wireguard_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/wireguard_test.go
+@@ -0,0 +1,179 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"testing"
++	"time"
++)
++
++func newTestWireGuard(t *testing.T, name string, port int) *WireGuard {
++	t.Helper()
++	option := WireGuardOption{
++		Name:       name,
++		Ip:         "10.9.0.2",
++		PrivateKey: "4F7zVRZpPEAHIEFBcZj4NITwyiXwzHHbRMpRlZr9bnk=",
++		UDP:        true,
++	}
++	option.Server = "127.0.0.1"
++	option.Port = port
++	option.PublicKey = "rsPXORPczwaVYfkc29uC6p2Vcjh2POFmL+quiQbBezk="
++	w, err := NewWireGuard(option)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = w.Close() })
++	return w
++}
++
++func initTestWireGuard(t *testing.T, w *WireGuard) error {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	return w.init(ctx)
++}
++
++// wireGuardDeviceClosed doesn't wait, because closing the device is synchronous.
++func wireGuardDeviceClosed(w *WireGuard) bool {
++	select {
++	case <-w.device.(interface{ Wait() chan struct{} }).Wait():
++		return true
++	default:
++		return false
++	}
++}
++
++// listenTestPeer returns a local UDP port that silently absorbs the handshakes.
++func listenTestPeer(t *testing.T) int {
++	t.Helper()
++	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = pc.Close() })
++	return pc.LocalAddr().(*net.UDPAddr).Port
++}
++
++func TestWireGuardTakeOverDevice(t *testing.T) {
++	port := listenTestPeer(t)
++
++	// the same proxy parsed by three config reloads
++	old := newTestWireGuard(t, "wg", port)
++	late := newTestWireGuard(t, "wg", port)
++	current := newTestWireGuard(t, "wg", port)
++
++	if err := initTestWireGuard(t, old); err != nil {
++		t.Fatal(err)
++	}
++	if err := initTestWireGuard(t, current); err != nil {
++		t.Fatal(err)
++	}
++	if !wireGuardDeviceClosed(old) {
++		t.Fatal("device of the outdated outbound is still running")
++	}
++
++	// an outdated outbound started later must not take the device back
++	if err := initTestWireGuard(t, late); !errors.Is(err, errWireGuardOutdated) {
++		t.Fatalf("expected %v, got %v", errWireGuardOutdated, err)
++	}
++	if wireGuardDeviceClosed(current) {
++		t.Fatal("device of the current outbound was closed")
++	}
++
++	_ = current.Close()
++	wireGuardDevicesMutex.Lock()
++	_, exist := wireGuardDevices[current.deviceKey()]
++	wireGuardDevicesMutex.Unlock()
++	if exist {
++		t.Fatal("closed outbound still holds its device key")
++	}
++}
++
++func TestWireGuardKeepDeviceOfOtherProxy(t *testing.T) {
++	port := listenTestPeer(t)
++
++	// different proxies that share a key are left alone
++	a := newTestWireGuard(t, "wg-a", port)
++	b := newTestWireGuard(t, "wg-b", port)
++
++	if err := initTestWireGuard(t, a); err != nil {
++		t.Fatal(err)
++	}
++	if err := initTestWireGuard(t, b); err != nil {
++		t.Fatal(err)
++	}
++	if wireGuardDeviceClosed(a) || wireGuardDeviceClosed(b) {
++		t.Fatal("device of another proxy was closed")
++	}
++}
++
++type blockingWireGuardClose struct {
++	wireguardGoDevice
++	once    sync.Once
++	entered chan struct{}
++	release chan struct{}
++}
++
++func (d *blockingWireGuardClose) Close() {
++	d.once.Do(func() {
++		close(d.entered)
++		<-d.release
++	})
++}
++
++func TestWireGuardWaitsForOverlappingReplacement(t *testing.T) {
++	old := newTestWireGuard(t, "test-overlapping", 41007)
++	middle := newTestWireGuard(t, "test-overlapping", 41007)
++	latest := newTestWireGuard(t, "test-overlapping", 41007)
++	device := &blockingWireGuardClose{entered: make(chan struct{}), release: make(chan struct{})}
++	old.device = device
++	var releaseOnce sync.Once
++	release := func() { releaseOnce.Do(func() { close(device.release) }) }
++	defer release()
++	if err := old.takeOverDevice(); err != nil {
++		t.Fatal(err)
++	}
++
++	middleResult := make(chan error, 1)
++	go func() {
++		middle.initMutex.Lock()
++		defer middle.initMutex.Unlock()
++		middleResult <- middle.takeOverDevice()
++	}()
++	select {
++	case <-device.entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("middle reload did not start closing the original device")
++	}
++
++	latestResult := make(chan error, 1)
++	go func() {
++		latest.initMutex.Lock()
++		defer latest.initMutex.Unlock()
++		latestResult <- latest.takeOverDevice()
++	}()
++	select {
++	case <-middle.runCtx.Done():
++	case <-time.After(5 * time.Second):
++		t.Fatal("latest reload did not cancel the middle reload")
++	}
++	select {
++	case err := <-latestResult:
++		t.Fatalf("latest reload bypassed the original device teardown: %v", err)
++	case <-time.After(100 * time.Millisecond):
++	}
++
++	release()
++	for _, result := range []chan error{middleResult, latestResult} {
++		select {
++		case err := <-result:
++			if err != nil {
++				t.Fatal(err)
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatal("replacement did not finish after the original device closed")
++		}
++	}
++}
