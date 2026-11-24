@@ -1,0 +1,522 @@
+Keep startup status visible at all log levels.
+
+Configuration milestones and successful listener binds describe startup
+progress. Print them at INFO even when ordinary INFO output is filtered
+and keep the same event severity for subscribers.
+
+Prepare TLS controller settings before opening its listener so the
+startup line follows successful setup and bind.
+
+
+diff --git a/config/config.go b/config/config.go
+index 7cf2eac..2693a75 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -626,7 +626,7 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
+ 
+ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	config := &Config{}
+-	log.Infoln("Start initial configuration in progress") //Segment finished in xxm
++	log.StartupInfoln("Start initial configuration in progress") //Segment finished in xxm
+ 	startTime := time.Now()
+ 
+ 	general, err := parseGeneral(rawCfg)
+@@ -690,8 +690,8 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	}
+ 	config.Listeners = listeners
+ 
+-	log.Infoln("Geodata Loader mode: %s", geodata.LoaderName())
+-	log.Infoln("Geosite Matcher implementation: %s", geodata.SiteMatcherName())
++	log.StartupInfoln("Geodata Loader mode: %s", geodata.LoaderName())
++	log.StartupInfoln("Geosite Matcher implementation: %s", geodata.SiteMatcherName())
+ 	ruleProviders, err := parseRuleProviders(rawCfg)
+ 	if err != nil {
+ 		return nil, err
+@@ -752,7 +752,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ 	}
+ 
+ 	elapsedTime := time.Since(startTime) / time.Millisecond                     // duration in ms
+-	log.Infoln("Initial configuration complete, total time: %dms", elapsedTime) //Segment finished in xxm
++	log.StartupInfoln("Initial configuration complete, total time: %dms", elapsedTime) //Segment finished in xxm
+ 
+ 	return config, nil
+ }
+diff --git a/dns/server.go b/dns/server.go
+index d476c29..eaa2a8e 100644
+--- a/dns/server.go
++++ b/dns/server.go
+@@ -110,7 +110,7 @@ func ReCreateServer(addr string, lc C.InboundListenConfig, service resolver.Serv
+ 			log.Warnln("Failed to Reuse UDP Address: %s", err)
+ 		}
+ 
+-		log.Infoln("DNS server(UDP) listening at: %s", p.LocalAddr().String())
++		log.StartupInfoln("DNS server(UDP) listening at: %s", p.LocalAddr().String())
+ 		server.udpServer = &D.Server{Addr: addr, PacketConn: p, Handler: server.UDPHandler()}
+ 		_ = server.udpServer.ActivateAndServe()
+ 	}()
+@@ -122,7 +122,7 @@ func ReCreateServer(addr string, lc C.InboundListenConfig, service resolver.Serv
+ 			return
+ 		}
+ 
+-		log.Infoln("DNS server(TCP) listening at: %s", l.Addr().String())
++		log.StartupInfoln("DNS server(TCP) listening at: %s", l.Addr().String())
+ 		server.tcpServer = &D.Server{Addr: addr, Listener: l, Handler: server.TCPHandler()}
+ 		_ = server.tcpServer.ActivateAndServe()
+ 	}()
+diff --git a/hub/route/server.go b/hub/route/server.go
+index 89d3869..0f64df4 100644
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -174,7 +174,7 @@ func start(cfg *Config) {
+ 			log.Errorln("External controller listen error: %s", err)
+ 			return
+ 		}
+-		log.Infoln("RESTful API listening at: %s", l.Addr().String())
++		log.StartupInfoln("RESTful API listening at: %s", l.Addr().String())
+ 
+ 		server := newControllerServer(router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors))
+ 		httpServer = server
+@@ -199,15 +199,6 @@ func startTLS(cfg *Config) {
+ 			return
+ 		}
+ 
+-		lc := inbound.NewListenConfig()
+-		lc.SetRouteMark(cfg.RoutingMark)
+-		l, err := lc.Listen(context.Background(), "tcp", cfg.TLSAddr)
+-		if err != nil {
+-			log.Errorln("External controller tls listen error: %s", err)
+-			return
+-		}
+-
+-		log.Infoln("RESTful API tls listening at: %s", l.Addr().String())
+ 		tlsConfig := &tls.Config{Time: ntp.Now}
+ 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+ 		tlsConfig.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+@@ -235,6 +226,16 @@ func startTLS(cfg *Config) {
+ 				return
+ 			}
+ 		}
++
++		lc := inbound.NewListenConfig()
++		lc.SetRouteMark(cfg.RoutingMark)
++		l, err := lc.Listen(context.Background(), "tcp", cfg.TLSAddr)
++		if err != nil {
++			log.Errorln("External controller tls listen error: %s", err)
++			return
++		}
++		log.StartupInfoln("RESTful API tls listening at: %s", l.Addr().String())
++
+ 		server := newControllerServer(router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors))
+ 		tlsServer = server
+ 		if err = server.Serve(tls.NewListener(l, tlsConfig)); err != nil {
+@@ -279,7 +280,7 @@ func startUnix(cfg *Config) {
+ 			return
+ 		}
+ 		_ = os.Chmod(addr, 0o666)
+-		log.Infoln("RESTful API unix listening at: %s", l.Addr().String())
++		log.StartupInfoln("RESTful API unix listening at: %s", l.Addr().String())
+ 
+ 		server := newControllerServer(router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors))
+ 		unixServer = server
+@@ -308,7 +309,7 @@ func startPipe(cfg *Config) {
+ 			log.Errorln("External controller pipe listen error: %s", err)
+ 			return
+ 		}
+-		log.Infoln("RESTful API pipe listening at: %s", l.Addr().String())
++		log.StartupInfoln("RESTful API pipe listening at: %s", l.Addr().String())
+ 
+ 		server := newControllerServer(router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors))
+ 		pipeServer = server
+diff --git a/listener/inbound/anytls.go b/listener/inbound/anytls.go
+index bcb9958..faf3b79 100644
+--- a/listener/inbound/anytls.go
++++ b/listener/inbound/anytls.go
+@@ -84,7 +84,7 @@ func (v *AnyTLS) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("AnyTLS[%s] proxy listening at: %s", v.Name(), v.Address())
++	log.StartupInfoln("AnyTLS[%s] proxy listening at: %s", v.Name(), v.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/http.go b/listener/inbound/http.go
+index 76397a8..5fc026d 100644
+--- a/listener/inbound/http.go
++++ b/listener/inbound/http.go
+@@ -82,7 +82,7 @@ func (h *HTTP) Listen(tunnel C.Tunnel) error {
+ 		}
+ 		h.l = append(h.l, l)
+ 	}
+-	log.Infoln("HTTP[%s] proxy listening at: %s", h.Name(), h.Address())
++	log.StartupInfoln("HTTP[%s] proxy listening at: %s", h.Name(), h.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/hysteria2.go b/listener/inbound/hysteria2.go
+index dcf315e..da938df 100644
+--- a/listener/inbound/hysteria2.go
++++ b/listener/inbound/hysteria2.go
+@@ -152,7 +152,7 @@ func (t *Hysteria2) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Hysteria2[%s] proxy listening at: %s", t.Name(), t.Address())
++	log.StartupInfoln("Hysteria2[%s] proxy listening at: %s", t.Name(), t.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/hysteria2_realm.go b/listener/inbound/hysteria2_realm.go
+index 5539b65..80fc71a 100644
+--- a/listener/inbound/hysteria2_realm.go
++++ b/listener/inbound/hysteria2_realm.go
+@@ -93,7 +93,7 @@ func (t *Hysteria2RealmServer) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Hysteria2_Realm[%s] proxy listening at: %s", t.Name(), t.Address())
++	log.StartupInfoln("Hysteria2_Realm[%s] proxy listening at: %s", t.Name(), t.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/mieru.go b/listener/inbound/mieru.go
+index 9f214a3..b9db448 100644
+--- a/listener/inbound/mieru.go
++++ b/listener/inbound/mieru.go
+@@ -90,7 +90,7 @@ func (m *Mieru) Listen(tunnel C.Tunnel) error {
+ 			go mieru.Handle(c, tunnel, req, additions...)
+ 		}
+ 	}()
+-	log.Infoln("Mieru[%s] proxy listening at: %s", m.Name(), m.Address())
++	log.StartupInfoln("Mieru[%s] proxy listening at: %s", m.Name(), m.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/mixed.go b/listener/inbound/mixed.go
+index 4508774..b80d3d6 100644
+--- a/listener/inbound/mixed.go
++++ b/listener/inbound/mixed.go
+@@ -90,7 +90,7 @@ func (m *Mixed) Listen(tunnel C.Tunnel) error {
+ 			m.lUDP = append(m.lUDP, lUDP)
+ 		}
+ 	}
+-	log.Infoln("Mixed(http+socks)[%s] proxy listening at: %s", m.Name(), m.Address())
++	log.StartupInfoln("Mixed(http+socks)[%s] proxy listening at: %s", m.Name(), m.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/redir.go b/listener/inbound/redir.go
+index 2981ddf..c933ef2 100644
+--- a/listener/inbound/redir.go
++++ b/listener/inbound/redir.go
+@@ -58,7 +58,7 @@ func (r *Redir) Listen(tunnel C.Tunnel) error {
+ 		}
+ 		r.l = append(r.l, l)
+ 	}
+-	log.Infoln("Redir[%s] proxy listening at: %s", r.Name(), r.Address())
++	log.StartupInfoln("Redir[%s] proxy listening at: %s", r.Name(), r.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/shadowsocks.go b/listener/inbound/shadowsocks.go
+index 13f06f6..a56ece6 100644
+--- a/listener/inbound/shadowsocks.go
++++ b/listener/inbound/shadowsocks.go
+@@ -98,7 +98,7 @@ func (s *ShadowSocks) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("ShadowSocks[%s] proxy listening at: %s", s.Name(), s.Address())
++	log.StartupInfoln("ShadowSocks[%s] proxy listening at: %s", s.Name(), s.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/snell.go b/listener/inbound/snell.go
+index 36d3bc0..fffc47d 100644
+--- a/listener/inbound/snell.go
++++ b/listener/inbound/snell.go
+@@ -88,7 +88,7 @@ func (s *Snell) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Snell[%s] inbound listening at: %s", s.Name(), s.Address())
++	log.StartupInfoln("Snell[%s] inbound listening at: %s", s.Name(), s.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/socks.go b/listener/inbound/socks.go
+index be2f931..5e19100 100644
+--- a/listener/inbound/socks.go
++++ b/listener/inbound/socks.go
+@@ -111,7 +111,7 @@ func (s *Socks) Listen(tunnel C.Tunnel) error {
+ 		}
+ 	}
+ 
+-	log.Infoln("SOCKS[%s] proxy listening at: %s", s.Name(), s.Address())
++	log.StartupInfoln("SOCKS[%s] proxy listening at: %s", s.Name(), s.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/sudoku.go b/listener/inbound/sudoku.go
+index c886bb7..38c8643 100644
+--- a/listener/inbound/sudoku.go
++++ b/listener/inbound/sudoku.go
+@@ -130,7 +130,7 @@ func (s *Sudoku) Listen(tunnel C.Tunnel) error {
+ 		return errors.Join(errs...)
+ 	}
+ 
+-	log.Infoln("Sudoku[%s] inbound listening at: %s", s.Name(), s.Address())
++	log.StartupInfoln("Sudoku[%s] inbound listening at: %s", s.Name(), s.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/tproxy.go b/listener/inbound/tproxy.go
+index 66a50f7..2ece368 100644
+--- a/listener/inbound/tproxy.go
++++ b/listener/inbound/tproxy.go
+@@ -70,7 +70,7 @@ func (t *TProxy) Listen(tunnel C.Tunnel) error {
+ 			t.lUDP = append(t.lUDP, lUDP)
+ 		}
+ 	}
+-	log.Infoln("TProxy[%s] proxy listening at: %s", t.Name(), t.Address())
++	log.StartupInfoln("TProxy[%s] proxy listening at: %s", t.Name(), t.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/trojan.go b/listener/inbound/trojan.go
+index 526b7c7..8263e8e 100644
+--- a/listener/inbound/trojan.go
++++ b/listener/inbound/trojan.go
+@@ -115,7 +115,7 @@ func (v *Trojan) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Trojan[%s] proxy listening at: %s", v.Name(), v.Address())
++	log.StartupInfoln("Trojan[%s] proxy listening at: %s", v.Name(), v.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/tuic.go b/listener/inbound/tuic.go
+index db2363c..108e7c4 100644
+--- a/listener/inbound/tuic.go
++++ b/listener/inbound/tuic.go
+@@ -92,7 +92,7 @@ func (t *Tuic) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Tuic[%s] proxy listening at: %s", t.Name(), t.Address())
++	log.StartupInfoln("Tuic[%s] proxy listening at: %s", t.Name(), t.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/tun.go b/listener/inbound/tun.go
+index a0f411b..4c7dd6b 100644
+--- a/listener/inbound/tun.go
++++ b/listener/inbound/tun.go
+@@ -171,7 +171,7 @@ func (t *Tun) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Tun[%s] proxy listening at: %s", t.Name(), t.Address())
++	log.StartupInfoln("Tun[%s] proxy listening at: %s", t.Name(), t.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/tunnel.go b/listener/inbound/tunnel.go
+index 1dfff0e..9aa29c1 100644
+--- a/listener/inbound/tunnel.go
++++ b/listener/inbound/tunnel.go
+@@ -100,7 +100,7 @@ func (t *Tunnel) Listen(tunnel C.Tunnel) error {
+ 			}
+ 		}
+ 	}
+-	log.Infoln("Tunnel[%s](%s)proxy listening at: %s", t.Name(), t.config.Target, t.Address())
++	log.StartupInfoln("Tunnel[%s](%s)proxy listening at: %s", t.Name(), t.config.Target, t.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/vless.go b/listener/inbound/vless.go
+index 503caf5..bee6e64 100644
+--- a/listener/inbound/vless.go
++++ b/listener/inbound/vless.go
+@@ -158,7 +158,7 @@ func (v *Vless) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Vless[%s] proxy listening at: %s", v.Name(), v.Address())
++	log.StartupInfoln("Vless[%s] proxy listening at: %s", v.Name(), v.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/inbound/vmess.go b/listener/inbound/vmess.go
+index d9768b8..fe5042f 100644
+--- a/listener/inbound/vmess.go
++++ b/listener/inbound/vmess.go
+@@ -108,7 +108,7 @@ func (v *Vmess) Listen(tunnel C.Tunnel) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infoln("Vmess[%s] proxy listening at: %s", v.Name(), v.Address())
++	log.StartupInfoln("Vmess[%s] proxy listening at: %s", v.Name(), v.Address())
+ 	return nil
+ }
+ 
+diff --git a/listener/listener.go b/listener/listener.go
+index 3a0a8aa..c58ae28 100644
+--- a/listener/listener.go
++++ b/listener/listener.go
+@@ -135,7 +135,7 @@ func ReCreateHTTP(port int, tunnel C.Tunnel) {
+ 		return
+ 	}
+ 
+-	log.Infoln("HTTP proxy listening at: %s", httpListener.Address())
++	log.StartupInfoln("HTTP proxy listening at: %s", httpListener.Address())
+ }
+ 
+ func ReCreateSocks(port int, tunnel C.Tunnel) {
+@@ -194,7 +194,7 @@ func ReCreateSocks(port int, tunnel C.Tunnel) {
+ 	socksListener = tcpListener
+ 	socksUDPListener = udpListener
+ 
+-	log.Infoln("SOCKS proxy listening at: %s", socksListener.Address())
++	log.StartupInfoln("SOCKS proxy listening at: %s", socksListener.Address())
+ }
+ 
+ func ReCreateRedir(port int, tunnel C.Tunnel) {
+@@ -240,7 +240,7 @@ func ReCreateRedir(port int, tunnel C.Tunnel) {
+ 		log.Warnln("Failed to start Redir UDP Listener: %s", err)
+ 	}
+ 
+-	log.Infoln("Redirect proxy listening at: %s", redirListener.Address())
++	log.StartupInfoln("Redirect proxy listening at: %s", redirListener.Address())
+ }
+ 
+ func ReCreateShadowSocks(shadowSocksConfig string, tunnel C.Tunnel) {
+@@ -292,7 +292,7 @@ func ReCreateShadowSocks(shadowSocksConfig string, tunnel C.Tunnel) {
+ 	shadowSocksListener = listener
+ 
+ 	for _, addr := range shadowSocksListener.AddrList() {
+-		log.Infoln("ShadowSocks proxy listening at: %s", addr.String())
++		log.StartupInfoln("ShadowSocks proxy listening at: %s", addr.String())
+ 	}
+ 	return
+ }
+@@ -344,7 +344,7 @@ func ReCreateVmess(vmessConfig string, tunnel C.Tunnel) {
+ 	vmessListener = listener
+ 
+ 	for _, addr := range vmessListener.AddrList() {
+-		log.Infoln("Vmess proxy listening at: %s", addr.String())
++		log.StartupInfoln("Vmess proxy listening at: %s", addr.String())
+ 	}
+ 	return
+ }
+@@ -389,7 +389,7 @@ func ReCreateTuic(config LC.TuicServer, tunnel C.Tunnel) {
+ 	tuicListener = listener
+ 
+ 	for _, addr := range tuicListener.AddrList() {
+-		log.Infoln("Tuic proxy listening at: %s", addr.String())
++		log.StartupInfoln("Tuic proxy listening at: %s", addr.String())
+ 	}
+ 	return
+ }
+@@ -437,7 +437,7 @@ func ReCreateTProxy(port int, tunnel C.Tunnel) {
+ 		log.Warnln("Failed to start TProxy UDP Listener: %s", err)
+ 	}
+ 
+-	log.Infoln("TProxy server listening at: %s", tproxyListener.Address())
++	log.StartupInfoln("TProxy server listening at: %s", tproxyListener.Address())
+ }
+ 
+ func ReCreateMixed(port int, tunnel C.Tunnel) {
+@@ -492,7 +492,7 @@ func ReCreateMixed(port int, tunnel C.Tunnel) {
+ 		return
+ 	}
+ 
+-	log.Infoln("Mixed(http+socks) proxy listening at: %s", mixedListener.Address())
++	log.StartupInfoln("Mixed(http+socks) proxy listening at: %s", mixedListener.Address())
+ }
+ 
+ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
+@@ -531,7 +531,7 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
+ 	}
+ 	tunLister = lister
+ 
+-	log.Infoln("[TUN] Tun adapter listening at: %s", tunLister.Address())
++	log.StartupInfoln("[TUN] Tun adapter listening at: %s", tunLister.Address())
+ }
+ 
+ func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
+@@ -611,7 +611,7 @@ func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
+ 				continue
+ 			}
+ 			tunnelTCPListeners[key] = l
+-			log.Infoln("Tunnel(tcp/%s) proxy %s listening at: %s", elm.target, elm.proxy, tunnelTCPListeners[key].Address())
++			log.StartupInfoln("Tunnel(tcp/%s) proxy %s listening at: %s", elm.target, elm.proxy, tunnelTCPListeners[key].Address())
+ 		} else {
+ 			l, err := LT.NewUDP(elm.addr, elm.target, elm.proxy, lc, tunnel)
+ 			if err != nil {
+@@ -619,7 +619,7 @@ func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
+ 				continue
+ 			}
+ 			tunnelUDPListeners[key] = l
+-			log.Infoln("Tunnel(udp/%s) proxy %s listening at: %s", elm.target, elm.proxy, tunnelUDPListeners[key].Address())
++			log.StartupInfoln("Tunnel(udp/%s) proxy %s listening at: %s", elm.target, elm.proxy, tunnelUDPListeners[key].Address())
+ 		}
+ 	}
+ }
+diff --git a/log/log.go b/log/log.go
+index 1fa59c6..04bb574 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -46,6 +46,13 @@ func Infoln(format string, v ...any) {
+ 	print(event)
+ }
+ 
++// StartupInfoln prints startup status at INFO regardless of the configured level.
++func StartupInfoln(format string, v ...any) {
++	event := newLog(INFO, format, v...)
++	logCh <- event
++	log.Infoln(event.Payload)
++}
++
+ func Warnln(format string, v ...any) {
+ 	event := newLog(WARNING, format, v...)
+ 	logCh <- event
+diff --git a/log/startup_test.go b/log/startup_test.go
+new file mode 100644
+index 0000000..bf43c6d
+--- /dev/null
++++ b/log/startup_test.go
+@@ -0,0 +1,32 @@
++package log
++
++import (
++	"bytes"
++	"strings"
++	"testing"
++
++	"github.com/sirupsen/logrus"
++)
++
++func TestStartupInfolnIgnoresTerminalThreshold(t *testing.T) {
++	previousLevel := Level()
++	previousOutput := logrus.StandardLogger().Out
++	t.Cleanup(func() {
++		SetLevel(previousLevel)
++		logrus.SetOutput(previousOutput)
++	})
++
++	for _, level := range []LogLevel{ERROR, SILENT} {
++		t.Run(level.String(), func(t *testing.T) {
++			var output bytes.Buffer
++			logrus.SetOutput(&output)
++			SetLevel(level)
++
++			Infoln("ordinary info")
++			StartupInfoln("startup status %d", 7)
++			if text := output.String(); strings.Count(text, "startup status 7") != 1 || strings.Contains(text, "ordinary info") {
++				t.Fatalf("unexpected terminal log: %q", text)
++			}
++		})
++	}
++}

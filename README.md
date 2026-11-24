@@ -61,7 +61,8 @@ unsupported proxy outside a provider.
 
 - **Persistent fake IP:** mappings and allocation progress are saved together,
   including replacement cleanup. Restarting the core or reloading the same range
-  no longer depends on a separate allocation checkpoint. Persistence requires
+  no longer depends on a separate allocation checkpoint. A rejected reload
+  with a different range preserves the active mappings. Persistence requires
   `profile.store-fake-ip: true` and a writable cache file. To retain it across a
   router reboot, keep the data directory on persistent storage: `/tmp` is cleared
   on reboot.
@@ -71,6 +72,15 @@ unsupported proxy outside a provider.
 - **Fallback selection:** if the saved proxy is absent after a provider refresh,
   the group uses its first alive proxy and preserves the saved selection for
   when that proxy returns.
+- **Provider retries.** An overdue provider refresh runs once at startup. Failed
+  initial downloads and cache writes follow retry backoff. Automatic retries
+  after HTTP `404`, `410`, or `429` wait half the configured provider
+  `interval`, rounded up to whole seconds. Other retry delays triple after each
+  successive failure, up to the provider interval.
+- **Provider download limits.** HTTP responses larger than the provider's
+  `size-limit` are rejected before parsing, preserving the previous cache.
+- **GeoDAT validation.** Valid custom GeoIP and GeoSite `.dat` files can omit the
+  `CN` category. The updater decodes downloaded replacements before saving them.
 - **XHTTP compatibility:** corrected path/query handling, default padding and
   selected `sc-*` values for zero ranges, and import of numeric/string ranges
   and download XMUX settings from `extra`.
@@ -85,6 +95,16 @@ unsupported proxy outside a provider.
   Request headers and TLS handshakes have a 15-second timeout, idle keep-alive
   connections close after 2 minutes, and the header-size limit is 256 KiB.
   Active requests and streaming responses have no overall read/write timeout.
+- **Startup logging.** Configuration milestones and successful controller,
+  inbound, DNS, and TUN starts are written to standard output at `INFO`, even
+  with `log-level: error` or `log-level: silent`. The TLS controller loads its
+  client CA and ECH settings before opening the listener.
+- **Debug logging.** The core skips formatting `DEBUG` messages when neither
+  standard output nor controller log subscribers request them.
+- **HTTP proxy authentication.** A `407` response closes the client connection
+  when the request body remains unread.
+- **WireGuard reloads.** A replacement device waits for the previous device to
+  close before starting, including during overlapping reloads.
 - **TPROXY UDP cleanup:** local sockets are released after 60 seconds of
   inactivity, with coordinated cleanup when sockets are replaced.
 - **Connection retries:** local socket resource exhaustion stops repeated dial

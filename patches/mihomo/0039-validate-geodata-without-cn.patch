@@ -1,0 +1,268 @@
+Validate GEO databases without requiring the CN category.
+
+Checking for one specific category mislabeled valid custom .dat files
+as corrupt. Check local record framing without loading matchers, and
+decode downloaded protobufs before replacing the previous database.
+
+Based on https://github.com/MetaCubeX/mihomo/pull/2836.
+
+diff --git a/component/geodata/utils.go b/component/geodata/utils.go
+index ee7946a..5ea3a69 100644
+--- a/component/geodata/utils.go
++++ b/component/geodata/utils.go
+@@ -53,11 +53,9 @@ func SetSiteMatcher(newMatcher string) {
+ func Verify(name string) error {
+ 	switch name {
+ 	case C.GeositeName:
+-		_, err := LoadGeoSiteMatcher("CN")
+-		return err
++		return verifyGeodataFile(C.Path.GeoSite())
+ 	case C.GeoipName:
+-		_, err := LoadGeoIPMatcher("CN")
+-		return err
++		return verifyGeodataFile(C.Path.GeoIP())
+ 	default:
+ 		return fmt.Errorf("not support name")
+ 	}
+diff --git a/component/geodata/verify.go b/component/geodata/verify.go
+new file mode 100644
+index 0000000..639babf
+--- /dev/null
++++ b/component/geodata/verify.go
+@@ -0,0 +1,71 @@
++package geodata
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"math"
++	"os"
++
++	"github.com/metacubex/mihomo/component/geodata/router"
++	C "github.com/metacubex/mihomo/constant"
++
++	"google.golang.org/protobuf/proto"
++)
++
++func verifyGeodataFile(path string) error {
++	file, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	return verifyGeodataReader(file)
++}
++
++func verifyGeodataReader(source io.Reader) error {
++	reader := bufio.NewReader(source)
++	hasEntry := false
++	for {
++		tag, err := reader.ReadByte()
++		if err == io.EOF && hasEntry {
++			return nil
++		}
++		if err != nil {
++			return fmt.Errorf("cannot read geodata entry: %w", err)
++		}
++		// GeoIPList and GeoSiteList both store entries as length-delimited field 1.
++		if tag != 0x0a {
++			return fmt.Errorf("unexpected geodata entry tag 0x%02x", tag)
++		}
++
++		size, err := binary.ReadUvarint(reader)
++		if err != nil {
++			return fmt.Errorf("cannot read geodata entry length: %w", err)
++		}
++		if size == 0 || size > math.MaxInt64 {
++			return fmt.Errorf("invalid geodata entry length %d", size)
++		}
++		if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
++			return fmt.Errorf("truncated geodata entry: %w", err)
++		}
++		hasEntry = true
++	}
++}
++
++// VerifyGeodataBytes checks the complete protobuf, including the contents of
++// each entry, before a download replaces the current database.
++func VerifyGeodataBytes(name string, data []byte) error {
++	if err := verifyGeodataReader(bytes.NewReader(data)); err != nil {
++		return err
++	}
++	switch name {
++	case C.GeositeName:
++		return proto.Unmarshal(data, &router.GeoSiteList{})
++	case C.GeoipName:
++		return proto.Unmarshal(data, &router.GeoIPList{})
++	default:
++		return fmt.Errorf("unsupported geodata name %q", name)
++	}
++}
+diff --git a/component/updater/update_geo.go b/component/updater/update_geo.go
+index 63e6d15..a3b5488 100644
+--- a/component/updater/update_geo.go
++++ b/component/updater/update_geo.go
+@@ -11,7 +11,6 @@ import (
+ 	"github.com/metacubex/mihomo/common/atomic"
+ 	"github.com/metacubex/mihomo/common/utils"
+ 	"github.com/metacubex/mihomo/component/geodata"
+-	_ "github.com/metacubex/mihomo/component/geodata/standard"
+ 	"github.com/metacubex/mihomo/component/mmdb"
+ 	"github.com/metacubex/mihomo/component/resource"
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -107,8 +106,6 @@ func UpdateASN() (err error) {
+ }
+ 
+ func UpdateGeoIp() (err error) {
+-	geoLoader, err := geodata.GetGeoDataLoader("standard")
+-
+ 	vehicle := resource.NewHTTPVehicle(geodata.GeoIpUrl(), C.Path.GeoIP(), "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+@@ -125,8 +122,8 @@ func UpdateGeoIp() (err error) {
+ 		return fmt.Errorf("can't download GeoIP database file: no data")
+ 	}
+ 
+-	if _, err = geoLoader.LoadIPByBytes(data, "cn"); err != nil {
+-		return fmt.Errorf("invalid GeoIP database file: %s", err)
++	if err = geodata.VerifyGeodataBytes(C.GeoipName, data); err != nil {
++		return fmt.Errorf("invalid GeoIP database file: %w", err)
+ 	}
+ 
+ 	defer geodata.ClearGeoIPCache()
+@@ -137,8 +134,6 @@ func UpdateGeoIp() (err error) {
+ }
+ 
+ func UpdateGeoSite() (err error) {
+-	geoLoader, err := geodata.GetGeoDataLoader("standard")
+-
+ 	vehicle := resource.NewHTTPVehicle(geodata.GeoSiteUrl(), C.Path.GeoSite(), "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+@@ -155,8 +150,8 @@ func UpdateGeoSite() (err error) {
+ 		return fmt.Errorf("can't download GeoSite database file: no data")
+ 	}
+ 
+-	if _, err = geoLoader.LoadSiteByBytes(data, "cn"); err != nil {
+-		return fmt.Errorf("invalid GeoSite database file: %s", err)
++	if err = geodata.VerifyGeodataBytes(C.GeositeName, data); err != nil {
++		return fmt.Errorf("invalid GeoSite database file: %w", err)
+ 	}
+ 
+ 	defer geodata.ClearGeoSiteCache()
+diff --git a/component/updater/update_geodata_verify_test.go b/component/updater/update_geodata_verify_test.go
+new file mode 100644
+index 0000000..c1e56c2
+--- /dev/null
++++ b/component/updater/update_geodata_verify_test.go
+@@ -0,0 +1,107 @@
++package updater
++
++import (
++	"bytes"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"sync/atomic"
++	"testing"
++
++	"github.com/metacubex/mihomo/component/geodata"
++	"github.com/metacubex/mihomo/component/geodata/router"
++	C "github.com/metacubex/mihomo/constant"
++
++	"google.golang.org/protobuf/encoding/protowire"
++	"google.golang.org/protobuf/proto"
++)
++
++func TestGeoDataUpdateWithoutCN(t *testing.T) {
++	previousHome := C.Path.HomeDir()
++	t.Cleanup(func() { C.SetHomeDir(previousHome) })
++	C.SetHomeDir(t.TempDir())
++
++	for _, tc := range []struct {
++		name   string
++		path   func() string
++		url    func() string
++		setURL func(string)
++		update func() error
++		list   func(string) proto.Message
++	}{
++		{
++			name: C.GeositeName, path: C.Path.GeoSite, url: geodata.GeoSiteUrl,
++			setURL: geodata.SetGeoSiteUrl, update: UpdateGeoSite,
++			list: func(category string) proto.Message {
++				return &router.GeoSiteList{Entry: []*router.GeoSite{{CountryCode: category}}}
++			},
++		},
++		{
++			name: C.GeoipName, path: C.Path.GeoIP, url: geodata.GeoIpUrl,
++			setURL: geodata.SetGeoIpUrl, update: UpdateGeoIp,
++			list: func(category string) proto.Message {
++				return &router.GeoIPList{Entry: []*router.GeoIP{{CountryCode: category}}}
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			previous, err := proto.Marshal(tc.list("PREVIOUS"))
++			if err != nil {
++				t.Fatal("cannot encode existing database")
++			}
++			replacement, err := proto.Marshal(tc.list("CUSTOM"))
++			if err != nil {
++				t.Fatal("cannot encode replacement database")
++			}
++			truncated := replacement[:len(replacement)-1]
++			path := tc.path()
++			if err := os.WriteFile(path, truncated, 0600); err != nil {
++				t.Fatal("cannot create truncated database")
++			}
++			if err := geodata.Verify(tc.name); err == nil {
++				t.Fatal("startup verification accepted a truncated file")
++			}
++			if err := os.WriteFile(path, previous, 0600); err != nil {
++				t.Fatal("cannot create existing database")
++			}
++			if err := geodata.Verify(tc.name); err != nil {
++				t.Fatal("startup verification rejected a custom database without CN")
++			}
++
++			// The outer record is complete, but its embedded protobuf is truncated.
++			invalidEntry := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), []byte{0x0a})
++			emptyEntry := protowire.AppendBytes(protowire.AppendTag(bytes.Clone(replacement), 1, protowire.BytesType), nil)
++			bodies := [][]byte{truncated, invalidEntry, emptyEntry, replacement}
++			var requests atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++				index := int(requests.Add(1)) - 1
++				if index >= len(bodies) {
++					w.WriteHeader(http.StatusInternalServerError)
++					return
++				}
++				_, _ = w.Write(bodies[index])
++			}))
++			t.Cleanup(server.Close)
++			previousURL := tc.url()
++			t.Cleanup(func() { tc.setURL(previousURL) })
++			tc.setURL(server.URL)
++
++			for _, reason := range []string{"truncated file", "invalid entry", "empty entry"} {
++				if err := tc.update(); err == nil {
++					t.Fatalf("update accepted a database with %s", reason)
++				}
++				saved, err := os.ReadFile(path)
++				if err != nil || !bytes.Equal(saved, previous) {
++					t.Fatalf("a database with %s replaced the existing file", reason)
++				}
++			}
++			if err := tc.update(); err != nil {
++				t.Fatalf("update rejected a database without CN: %T", err)
++			}
++			saved, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(saved, replacement) {
++				t.Fatal("valid custom database was not installed")
++			}
++		})
++	}
++}

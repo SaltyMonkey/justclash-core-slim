@@ -1,0 +1,487 @@
+Add optional sequential queries within existing DNS upstream lists.
+
+Set dns.query-mode: sequential to try each server in configuration order.
+Each DNS server gets its own timeout (default 5s). Set
+dns.query-attempt-timeout (for example 800ms) to change it.
+The caller's deadline and cancellation still apply.
+
+The default mode is parallel. Preserve fallback-lazy-query and the
+internal resolution strategy of system:// and dhcp:// clients.
+
+diff --git a/config/config.go b/config/config.go
+--- a/config/config.go
++++ b/config/config.go
+@@ -145,6 +145,7 @@
+ 
+ // DNS config
+ type DNS struct {
++	QueryOptions          dns.QueryOptions
+ 	Enable                bool
+ 	PreferH3              bool
+ 	IPv6                  bool
+@@ -219,6 +220,8 @@
+ }
+ 
+ type RawDNS struct {
++	QueryMode                    string                              `yaml:"query-mode" json:"query-mode"`
++	QueryAttemptTimeout          string                              `yaml:"query-attempt-timeout" json:"query-attempt-timeout"`
+ 	Enable                       bool                                `yaml:"enable" json:"enable"`
+ 	PreferH3                     bool                                `yaml:"prefer-h3" json:"prefer-h3"`
+ 	IPv6                         bool                                `yaml:"ipv6" json:"ipv6"`
+@@ -1438,6 +1441,9 @@
+ 		CacheMaxSize:      cfg.CacheMaxSize,
+ 	}
+ 	var err error
++	if dnsCfg.QueryOptions, err = dns.ParseQueryOptions(cfg.QueryMode, cfg.QueryAttemptTimeout); err != nil {
++		return nil, err
++	}
+ 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/dns/query_sequential.go b/dns/query_sequential.go
+new file mode 100644
+--- /dev/null
++++ b/dns/query_sequential.go
+@@ -0,0 +1,97 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/log"
++	D "github.com/miekg/dns"
++)
++
++// QueryOptions controls how a single explicitly configured upstream list is queried.
++type QueryOptions struct {
++	sequential     bool
++	attemptTimeout time.Duration
++}
++
++// ParseQueryOptions validates the DNS query mode and its optional per-server timeout.
++func ParseQueryOptions(mode, timeout string) (QueryOptions, error) {
++	var options QueryOptions
++	switch mode {
++	case "", "parallel":
++	case "sequential":
++		options.sequential = true
++	default:
++		return QueryOptions{}, errors.New("dns.query-mode must be parallel or sequential")
++	}
++	if timeout != "" {
++		duration, err := time.ParseDuration(timeout)
++		if err != nil || duration <= 0 {
++			return QueryOptions{}, errors.New("dns.query-attempt-timeout must be a positive duration such as 800ms")
++		}
++		options.attemptTimeout = duration
++	}
++	return options, nil
++}
++
++func (o QueryOptions) exchange(ctx context.Context, clients []dnsClient, request *D.Msg) (*D.Msg, bool, error) {
++	if !o.sequential {
++		return batchExchange(ctx, clients, request)
++	}
++	return o.exchangeSequential(ctx, clients, request)
++}
++
++func (o QueryOptions) exchangeSequential(ctx context.Context, clients []dnsClient, request *D.Msg) (*D.Msg, bool, error) {
++	attemptTimeout := o.attemptTimeout
++	if attemptTimeout == 0 {
++		attemptTimeout = resolver.DefaultDNSTimeout
++	}
++
++	var lastErr error
++	for _, client := range clients {
++		if err := ctx.Err(); err != nil {
++			return nil, false, err
++		}
++
++		if log.DebugEnabled() {
++			_, qtype := msgToQtype(request)
++			log.Debugln("[DNS] resolve %s %s from %s", msgToDomain(request), qtype, client.Address())
++		}
++		question := request
++		_, synthetic := client.(rcodeClient)
++		if synthetic {
++			// A synthetic response mutates its input, which another group may still read.
++			question = request.Copy()
++		}
++		attempt, stop := context.WithTimeout(ctx, attemptTimeout)
++		reply, err := client.ExchangeContext(attempt, question)
++		attemptErr := attempt.Err()
++		stop()
++
++		if err := ctx.Err(); err != nil {
++			return nil, false, err
++		}
++		switch {
++		case err != nil:
++			lastErr = err
++		case attemptErr != nil:
++			lastErr = attemptErr
++		case reply == nil:
++			lastErr = errors.New("empty DNS response")
++		case !synthetic && (reply.Rcode == D.RcodeServerFailure || reply.Rcode == D.RcodeRefused):
++			lastErr = fmt.Errorf("server failure: %s", D.RcodeToString[reply.Rcode])
++		default:
++			if log.DebugEnabled() {
++				log.Debugln("[DNS] %s --> %s from %s", msgToDomain(request), msgToLogString(reply), client.Address())
++			}
++			return reply, !synthetic, nil
++		}
++	}
++	if lastErr != nil {
++		return nil, false, fmt.Errorf("all DNS requests failed, last error: %w", lastErr)
++	}
++	return nil, false, errors.New("all DNS requests failed")
++}
+diff --git a/dns/query_sequential_test.go b/dns/query_sequential_test.go
+new file mode 100644
+--- /dev/null
++++ b/dns/query_sequential_test.go
+@@ -0,0 +1,256 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	D "github.com/miekg/dns"
++)
++
++type queryTestClient func(context.Context, *D.Msg) (*D.Msg, error)
++
++func (c queryTestClient) ExchangeContext(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
++	return c(ctx, msg)
++}
++func (queryTestClient) Address() string  { return "sequence-fixture" }
++func (queryTestClient) ResetConnection() {}
++
++func sequentialQuestion(qtype uint16) *D.Msg {
++	return new(D.Msg).SetQuestion("sequence-fixture.invalid.", qtype)
++}
++
++func sequentialAnswer(question *D.Msg) *D.Msg {
++	reply := new(D.Msg).SetReply(question)
++	reply.Answer = []D.RR{&D.A{
++		Hdr: D.RR_Header{Name: question.Question[0].Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60},
++		A:   net.IPv4(192, 0, 2, 20),
++	}}
++	return reply
++}
++
++func TestParseQueryOptions(t *testing.T) {
++	if options, err := ParseQueryOptions("", ""); err != nil || options != (QueryOptions{}) {
++		t.Fatalf("default query options are invalid: %v", err)
++	}
++	want := QueryOptions{sequential: true, attemptTimeout: 800 * time.Millisecond}
++	if options, err := ParseQueryOptions("sequential", "800ms"); err != nil || options != want {
++		t.Fatalf("sequential query options are invalid: %v", err)
++	}
++	for _, input := range [][2]string{{"unknown", ""}, {"sequential", "0ms"}, {"sequential", "-5ms"}, {"sequential", "800"}} {
++		if _, err := ParseQueryOptions(input[0], input[1]); err == nil {
++			t.Fatal("accepted invalid query options")
++		}
++	}
++}
++
++func TestSequentialDNSAcceptsTerminalResponses(t *testing.T) {
++	for _, test := range []struct {
++		name   string
++		rcode  int
++		answer bool
++	}{
++		{"positive", D.RcodeSuccess, true},
++		{"nodata", D.RcodeSuccess, false},
++		{"nxdomain", D.RcodeNameError, false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			var backupCalled bool
++			clients := []dnsClient{
++				queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++					if test.answer {
++						return sequentialAnswer(req), nil
++					}
++					return new(D.Msg).SetRcode(req, test.rcode), nil
++				}),
++				queryTestClient(func(_ context.Context, _ *D.Msg) (*D.Msg, error) {
++					backupCalled = true
++					return nil, errors.New("unexpected backup")
++				}),
++			}
++			options := QueryOptions{sequential: true}
++			reply, cache, err := options.exchange(context.Background(), clients, sequentialQuestion(D.TypeA))
++			if err != nil || !cache || reply.Rcode != test.rcode || backupCalled {
++				t.Fatalf("terminal response used the backup or was rejected: %v", err)
++			}
++		})
++	}
++}
++
++func TestSequentialDNSRetriesInOrder(t *testing.T) {
++	var calls []int
++	clients := []dnsClient{
++		queryTestClient(func(_ context.Context, _ *D.Msg) (*D.Msg, error) {
++			calls = append(calls, 0)
++			return nil, errors.New("synthetic transport failure")
++		}),
++		queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++			calls = append(calls, 1)
++			return new(D.Msg).SetRcode(req, D.RcodeServerFailure), nil
++		}),
++		queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++			calls = append(calls, 2)
++			return new(D.Msg).SetRcode(req, D.RcodeRefused), nil
++		}),
++		queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++			calls = append(calls, 3)
++			return sequentialAnswer(req), nil
++		}),
++	}
++	opts := QueryOptions{sequential: true}
++	reply, _, err := opts.exchange(context.Background(), clients, sequentialQuestion(D.TypeA))
++	if err != nil || len(reply.Answer) != 1 || len(calls) != 4 || calls[0] != 0 || calls[1] != 1 || calls[2] != 2 || calls[3] != 3 {
++		t.Fatalf("unexpected retry order %v: %v", calls, err)
++	}
++}
++
++func TestSequentialDNSDeadlineIsPerServer(t *testing.T) {
++	for _, test := range []struct {
++		name  string
++		value time.Duration
++		want  time.Duration
++	}{
++		{"default", 0, resolver.DefaultDNSTimeout},
++		{"explicit", 4 * time.Second, 4 * time.Second},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			start := time.Now()
++			count := 0
++			firstFails := queryTestClient(func(attempt context.Context, req *D.Msg) (*D.Msg, error) {
++				count++
++				deadline, ok := attempt.Deadline()
++				if !ok || deadline.Before(start.Add(test.want)) || deadline.After(time.Now().Add(test.want)) {
++					t.Error("the server did not receive its full timeout")
++				}
++				if count == 1 {
++					return nil, errors.New("synthetic transport failure")
++				}
++				return sequentialAnswer(req), nil
++			})
++			opts := QueryOptions{sequential: true, attemptTimeout: test.value}
++			reply, _, err := opts.exchange(context.Background(), []dnsClient{firstFails, firstFails}, sequentialQuestion(D.TypeA))
++			if err != nil || len(reply.Answer) != 1 || count != 2 {
++				t.Fatalf("expected first and second servers to be tried: %v", err)
++			}
++		})
++	}
++}
++
++func TestSequentialDNSAttemptTimeoutAllowsBackup(t *testing.T) {
++	var timedOut int
++	blackhole := queryTestClient(func(attempt context.Context, _ *D.Msg) (*D.Msg, error) {
++		<-attempt.Done()
++		timedOut++
++		return nil, attempt.Err()
++	})
++	backup := queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++		return sequentialAnswer(req), nil
++	})
++	opts := QueryOptions{sequential: true, attemptTimeout: 15 * time.Millisecond}
++	reply, _, err := opts.exchange(context.Background(), []dnsClient{blackhole, blackhole, backup}, sequentialQuestion(D.TypeA))
++	if err != nil || len(reply.Answer) != 1 || timedOut != 2 {
++		t.Fatalf("a timed-out server prevented the backup from answering: %v", err)
++	}
++}
++
++func TestSequentialDNSRespectsParentDeadline(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
++	defer cancel()
++	deadline, _ := ctx.Deadline()
++	client := queryTestClient(func(attempt context.Context, req *D.Msg) (*D.Msg, error) {
++		actual, ok := attempt.Deadline()
++		if !ok || !actual.Equal(deadline) {
++			t.Error("the attempt deadline didn't follow the caller's earlier deadline")
++		}
++		return sequentialAnswer(req), nil
++	})
++	opts := QueryOptions{sequential: true, attemptTimeout: 2 * time.Minute}
++	if _, _, err := opts.exchange(ctx, []dnsClient{client}, sequentialQuestion(D.TypeA)); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestSequentialDNSCancelStopsNextServer(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	called := false
++	clients := []dnsClient{
++		queryTestClient(func(attempt context.Context, _ *D.Msg) (*D.Msg, error) {
++			cancel()
++			return nil, attempt.Err()
++		}),
++		queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++			called = true
++			return sequentialAnswer(req), nil
++		}),
++	}
++	_, _, err := (QueryOptions{sequential: true}).exchange(ctx, clients, sequentialQuestion(D.TypeA))
++	if !errors.Is(err, context.Canceled) || called {
++		t.Fatalf("resolver didn't stop on cancellation: %v", err)
++	}
++}
++
++func TestSequentialDNSSyntheticResponse(t *testing.T) {
++	request := sequentialQuestion(D.TypeTXT)
++	clients := []dnsClient{
++		queryTestClient(func(_ context.Context, _ *D.Msg) (*D.Msg, error) {
++			return nil, errors.New("synthetic transport failure")
++		}),
++		newRCodeClient("refused"),
++	}
++	reply, cache, err := (QueryOptions{sequential: true}).exchange(context.Background(), clients, request)
++	if err != nil || cache || reply.Rcode != D.RcodeRefused || request.Response {
++		t.Fatalf("configured rcode lost its terminal behavior or mutated the question: %v", err)
++	}
++}
++
++func TestSequentialDNSKeepsFallbackLaunchPolicy(t *testing.T) {
++	for _, lazy := range []bool{false, true} {
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		mainDone := atomic.Bool{}
++		fallbackStarted := make(chan bool, 1)
++		r := &Resolver{
++			queryConfig:       QueryOptions{sequential: true},
++			fallbackLazyQuery: lazy,
++			main: []dnsClient{queryTestClient(func(ctx context.Context, req *D.Msg) (*D.Msg, error) {
++				if !lazy {
++					select {
++					case before := <-fallbackStarted:
++						if before {
++							return nil, errors.New("parallel fallback waited for the main group")
++						}
++					case <-ctx.Done():
++						return nil, ctx.Err()
++					}
++				}
++				mainDone.Store(true)
++				if lazy {
++					return nil, errors.New("force fallback after main failure")
++				}
++				return sequentialAnswer(req), nil
++			})},
++			fallback: []dnsClient{queryTestClient(func(_ context.Context, req *D.Msg) (*D.Msg, error) {
++				fallbackStarted <- mainDone.Load()
++				if lazy && !mainDone.Load() {
++					return nil, errors.New("lazy fallback ran before the main group")
++				}
++				reply := sequentialAnswer(req)
++				reply.Answer[0].(*D.A).A = net.IPv4(192, 0, 2, 21)
++				return reply, nil
++			})},
++		}
++		reply, err := r.ipExchange(ctx, sequentialQuestion(D.TypeA))
++		cancel()
++		if err != nil || len(reply.Answer) != 1 {
++			t.Fatalf("fallback launch policy changed (lazy=%t): %v", lazy, err)
++		}
++		fromFallback := reply.Answer[0].(*D.A).A.To4()[3] == 21
++		if fromFallback != lazy {
++			t.Fatalf("the wrong group supplied the answer (lazy=%t)", lazy)
++		}
++	}
++}
+diff --git a/dns/resolver.go b/dns/resolver.go
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -37,6 +37,7 @@
+ }
+ 
+ type Resolver struct {
++	queryConfig           QueryOptions
+ 	ipv6                  bool
+ 	ipv6Timeout           time.Duration
+ 	main                  []dnsClient
+@@ -214,10 +215,10 @@
+ 		}
+ 
+ 		if matched := r.matchPolicy(m); len(matched) != 0 {
+-			result, cache, err = batchExchange(ctx, matched, m)
++			result, cache, err = r.queryConfig.exchange(ctx, matched, m)
+ 			return
+ 		}
+-		result, cache, err = batchExchange(ctx, r.main, m)
++		result, cache, err = r.queryConfig.exchange(ctx, r.main, m)
+ 		return
+ 	}
+ 
+@@ -377,7 +378,7 @@
+ func (r *Resolver) asyncExchange(ctx context.Context, client []dnsClient, msg *D.Msg) <-chan *result {
+ 	ch := make(chan *result, 1)
+ 	go func() {
+-		res, _, err := batchExchange(ctx, client, msg)
++		res, _, err := r.queryConfig.exchange(ctx, client, msg)
+ 		ch <- &result{Msg: res, Error: err}
+ 	}()
+ 	return ch
+@@ -470,6 +471,7 @@
+ }
+ 
+ type Config struct {
++	QueryOptions         QueryOptions
+ 	Main, Fallback       []NameServer
+ 	Default              []NameServer
+ 	ProxyServer          []NameServer
+@@ -526,6 +528,7 @@
+ 
+ func NewResolver(config Config) (rs Resolvers) {
+ 	defaultResolver := &Resolver{
++		queryConfig: config.QueryOptions,
+ 		main:        transform(config.Default, nil),
+ 		cache:       config.newCache(),
+ 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+@@ -596,6 +599,7 @@
+ 	}
+ 
+ 	r := &Resolver{
++		queryConfig: config.QueryOptions,
+ 		ipv6:        config.IPv6,
+ 		main:        cacheTransform(config.Main),
+ 		cache:       config.newCache(),
+@@ -607,6 +611,7 @@
+ 
+ 	if len(config.ProxyServer) != 0 {
+ 		rs.ProxyResolver = &Resolver{
++			queryConfig: config.QueryOptions,
+ 			ipv6:        config.IPv6,
+ 			main:        cacheTransform(config.ProxyServer),
+ 			cache:       config.newCache(),
+@@ -617,6 +622,7 @@
+ 
+ 	if len(config.DirectServer) != 0 {
+ 		rs.DirectResolver = &Resolver{
++			queryConfig: config.QueryOptions,
+ 			ipv6:        config.IPv6,
+ 			main:        cacheTransform(config.DirectServer),
+ 			cache:       config.newCache(),
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -248,6 +248,7 @@
+ 
+ 	ipv6 := c.IPv6 && generalIPv6
+ 	r := dns.NewResolver(dns.Config{
++		QueryOptions:         c.QueryOptions,
+ 		Main:                 c.NameServer,
+ 		Fallback:             c.Fallback,
+ 		IPv6:                 ipv6,

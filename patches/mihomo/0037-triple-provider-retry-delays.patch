@@ -1,0 +1,43 @@
+Triple provider backoff delays after successive failures.
+
+Doubling kept retries frequent during a persistent failure. Tripling
+spaces them farther apart (30, 90 and 270 seconds with a ten-second base).
+The configured provider interval caps the delay.
+
+diff --git a/component/resource/fetcher.go b/component/resource/fetcher.go
+index ad78e04..df2c0df 100644
+--- a/component/resource/fetcher.go
++++ b/component/resource/fetcher.go
+@@ -305,5 +305,5 @@ func NewFetcher[V any](name string, interval time.Duration, vehicle P.Vehicle, b
+ 		interval:   interval,
+ 		backoff: slowdown.Backoff{
+-			Factor: 2,
++			Factor: 3,
+ 			Jitter: false,
+ 			Min:    minBackoff,
+diff --git a/component/resource/fetcher_backoff_test.go b/component/resource/fetcher_backoff_test.go
+new file mode 100644
+index 0000000..1606ffd
+--- /dev/null
++++ b/component/resource/fetcher_backoff_test.go
+@@ -0,0 +1,20 @@
++package resource
++
++import (
++	"testing"
++	"time"
++)
++
++func TestProviderBackoffTriplesUntilInterval(t *testing.T) {
++	const interval = 5 * time.Minute
++	fetcher := NewFetcher[string](t.Name(), interval, nil, nil, nil, nil)
++	defer fetcher.Close()
++
++	for _, want := range []time.Duration{30 * time.Second, 90 * time.Second, 270 * time.Second, interval, interval} {
++		fetcher.backoff.AddAttempt()
++		attempt := fetcher.backoff.Attempt()
++		if got := fetcher.backoff.ForAttempt(attempt); got != want {
++			t.Fatalf("backoff after %v failures = %v, want %v", attempt, got, want)
++		}
++	}
++}

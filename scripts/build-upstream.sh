@@ -300,6 +300,25 @@ reduce temporary allocations. The binary format and loaded rule representation
 are unchanged. This adapts upstream PR #3423 at revision
 b3c35ab197d8d21328e5f8f77847186de932d6b6, with additional downstream tests.
 
+Rejected configuration reloads with a different fake-IP range preserve active
+mappings. WireGuard replacements wait for the previous device to close, including
+during overlapping reloads.
+
+Providers refresh overdue caches once at startup and apply backoff after failed
+downloads or cache writes. HTTP 404, 410, and 429 set the next automatic
+retry to half the provider interval, rounded up to whole seconds. Other retry
+delays triple with successive failures and are capped at the provider interval.
+Responses exceeding \`size-limit\` are rejected before parsing or cache replacement.
+
+GeoIP and GeoSite .dat validation accepts custom databases without the CN
+category. The updater decodes replacements before saving them. HTTP proxies close
+the connection after a 407 when the request body remains unread.
+
+Configuration milestones and successful controller, inbound, DNS, and TUN starts
+are printed at INFO at every log level. The TLS controller loads client CA and
+ECH settings before opening its listener. DEBUG formatting is skipped when both
+standard output and controller log subscribers filter it out.
+
 This modified source is distributed under GPL-3.0. See \`LICENSE\` for the full
 license text. Original copyright and license notices remain in effect.
 
@@ -497,6 +516,12 @@ fi
   echo "- SOCKS5 supports optional \`resolve-destination: true\` through the existing core DNS resolver."
   echo "- Proxy providers skip build-disabled protocols with a warning; other parse errors remain fatal and empty updates preserve the previous list."
   echo "- MRS loading reuses binary-reader buffers and uses synchronous zstd decoding to reduce temporary allocations (upstream PR #3423, with downstream tests)."
+  echo "- Overdue provider refreshes run once at startup. HTTP 404, 410, and 429 defer automatic retries by half the configured interval, rounded up to whole seconds. Other retry delays triple up to the interval."
+  echo "- Provider downloads that exceed \`size-limit\` are rejected before parsing, preserving the previous cache."
+  echo "- GeoIP and GeoSite .dat validation accepts custom databases without the CN category and decodes updates before saving them."
+  echo "- HTTP proxies close the connection after a 407 when the request body remains unread."
+  echo "- Configuration milestones and successful controller, inbound, DNS, and TUN starts stay visible at INFO even with \`log-level: error\` or \`log-level: silent\`. DEBUG formatting is skipped when neither standard output nor log subscribers request it."
+  echo "- Rejected reloads with a different fake-IP range preserve active mappings. WireGuard replacement waits for the previous device to close."
   echo "- The runtime version carries the \`-slim\` suffix."
   echo
   echo "### Build profile"

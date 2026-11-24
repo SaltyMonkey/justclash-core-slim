@@ -1,0 +1,173 @@
+Avoid duplicate provider refreshes at startup.
+
+Run an overdue refresh once through the timer. After a failed cold-start
+download, use the backoff from that attempt. A failed cache write also
+counts as a failed refresh, and a successful save resets the backoff.
+
+diff --git a/component/resource/fetcher.go b/component/resource/fetcher.go
+index 464af2e..d61fd86 100644
+--- a/component/resource/fetcher.go
++++ b/component/resource/fetcher.go
+@@ -149,13 +149,13 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
+ 		f.backoff.AddAttempt() // add a failed attempt to backoff
+ 		return lo.Empty[V](), false, err
+ 	}
+-	f.backoff.Reset() // no error, reset backoff
+-
+ 	if updateFile {
+ 		if err = f.vehicle.Write(buf); err != nil {
++			f.backoff.AddAttempt()
+ 			return lo.Empty[V](), false, err
+ 		}
+ 	}
++	f.backoff.Reset()
+ 	f.updatedAt = now
+ 	f.hash = hash
+ 
+@@ -182,12 +182,9 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+ 
+ 	if forceUpdate {
+ 		log.Warnln("[Provider] %s not updated for a long time, force refresh", f.Name())
+-		f.updateWithLog()
+-	}
+-	if attempt := f.backoff.Attempt(); attempt > 0 { // f.Update() was failed, decrease the interval from backoff to achieve fast retry
+-		if duration := f.backoff.ForAttempt(attempt); duration < initialInterval {
+-			initialInterval = duration
+-		}
++		initialInterval = 0
++	} else if attempt := f.backoff.Attempt(); attempt > 0 {
++		initialInterval = f.backoff.ForAttempt(attempt)
+ 	}
+ 
+ 	timer := time.NewTimer(initialInterval)
+diff --git a/component/resource/fetcher_startup_test.go b/component/resource/fetcher_startup_test.go
+new file mode 100644
+index 0000000..925c880
+--- /dev/null
++++ b/component/resource/fetcher_startup_test.go
+@@ -0,0 +1,125 @@
++package resource
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func newTestHTTPFetcher(t *testing.T, interval time.Duration, handler http.HandlerFunc) *Fetcher[string] {
++	t.Helper()
++
++	cachePath := filepath.Join(t.TempDir(), "provider")
++	server := httptest.NewServer(handler)
++	t.Cleanup(server.Close)
++
++	vehicle := NewHTTPVehicle(server.URL, cachePath, "", nil, 5*time.Second, 0)
++	fetcher := NewFetcher(t.Name(), interval, vehicle, nil, func(buf []byte) (string, error) {
++		return string(buf), nil
++	}, nil)
++	t.Cleanup(func() { _ = fetcher.Close() })
++	return fetcher
++}
++
++func waitForProviderRequest(t *testing.T, requests <-chan time.Time) time.Time {
++	t.Helper()
++
++	select {
++	case at := <-requests:
++		return at
++	case <-time.After(5 * time.Second):
++		t.Fatal("timed out waiting for a provider request")
++		return time.Time{}
++	}
++}
++
++func TestProviderStartupSchedulesNextRequest(t *testing.T) {
++	const interval = 500 * time.Millisecond
++
++	for _, tc := range []struct {
++		name   string
++		cached bool
++	}{
++		{name: "overdue cache", cached: true},
++		{name: "failed cold start"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			requests := make(chan time.Time, 2)
++			fetcher := newTestHTTPFetcher(t, interval, func(w http.ResponseWriter, _ *http.Request) {
++				select {
++				case requests <- time.Now():
++				default:
++				}
++				if !tc.cached {
++					w.WriteHeader(http.StatusServiceUnavailable)
++					return
++				}
++				_, _ = io.WriteString(w, "fresh")
++			})
++
++			fetcher.backoff.Min = 100 * time.Millisecond
++			delay := fetcher.backoff.ForAttempt(1)
++			if tc.cached {
++				cachePath := fetcher.Vehicle().Path()
++				if err := os.WriteFile(cachePath, []byte("cached"), 0600); err != nil {
++					t.Fatal("cannot seed provider cache")
++				}
++				past := time.Now().Add(-time.Hour)
++				if err := os.Chtimes(cachePath, past, past); err != nil {
++					t.Fatal("cannot age provider cache")
++				}
++				delay = interval
++			}
++
++			value, err := fetcher.Initial()
++			if tc.cached {
++				if err != nil || value != "cached" {
++					t.Fatalf("expected cached value and no error, got %q and error type %T", value, err)
++				}
++			} else if err == nil {
++				t.Fatal("cold start should report the HTTP error")
++			}
++
++			first := waitForProviderRequest(t, requests)
++			second := waitForProviderRequest(t, requests)
++			if got := second.Sub(first); got < delay {
++				t.Fatalf("second request after %v, want at least %v", got, delay)
++			}
++		})
++	}
++}
++
++func TestProviderCacheWriteFailureIncreasesBackoff(t *testing.T) {
++	vehicle := NewFileVehicle(filepath.Join(t.TempDir(), "provider"))
++	fetcher := NewFetcher(t.Name(), time.Hour, vehicle, nil, func(buf []byte) (string, error) {
++		return string(buf), nil
++	}, nil)
++	defer fetcher.Close()
++
++	// A directory at the cache path makes the write fail on every platform.
++	if err := os.Mkdir(vehicle.Path(), 0700); err != nil {
++		t.Fatal("cannot prepare unwritable cache path")
++	}
++	fetcher.backoff.AddAttempt()
++
++	if _, _, err := fetcher.SideUpdate([]byte("fresh")); err == nil {
++		t.Fatal("expected a cache write error")
++	}
++	if got := fetcher.backoff.Attempt(); got != 2 {
++		t.Fatalf("attempts after failed write = %v, want 2", got)
++	}
++
++	if err := os.Remove(vehicle.Path()); err != nil {
++		t.Fatal("cannot clear unwritable cache path")
++	}
++	if _, _, err := fetcher.SideUpdate([]byte("fresh")); err != nil {
++		t.Fatalf("cache write failed with error type %T", err)
++	}
++	if got := fetcher.backoff.Attempt(); got != 0 {
++		t.Fatalf("attempts after successful write = %v, want 0", got)
++	}
++}

@@ -1,0 +1,259 @@
+Wait half the provider interval after HTTP 404, 410 or 429.
+
+For these responses, reset the fast retry counter and set a local
+deadline from half the configured interval, rounded up to whole seconds.
+Use the remaining deadline when scheduling automatic retries.
+
+
+diff --git a/component/resource/fetcher.go b/component/resource/fetcher.go
+index d61fd86..bf1d450 100644
+--- a/component/resource/fetcher.go
++++ b/component/resource/fetcher.go
+@@ -2,10 +2,12 @@ package resource
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"io"
+ 	"io/fs"
+ 	"os"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/utils"
+@@ -20,6 +22,15 @@ import (
+ type Parser[V any] func([]byte) (V, error)
+ type BundleFile func() (fs.File, error)
+ 
++type providerRetryError struct {
++	status string
++	until  time.Time
++}
++
++func (e *providerRetryError) Error() string {
++	return e.status + " (next retry at " + e.until.UTC().Format(time.RFC3339) + ")"
++}
++
+ type Fetcher[V any] struct {
+ 	ctx          context.Context
+ 	ctxCancel    context.CancelFunc
+@@ -35,6 +46,7 @@ type Fetcher[V any] struct {
+ 	watcher      *fswatch.Watcher
+ 	loadBufMutex sync.Mutex
+ 	backoff      slowdown.Backoff
++	retryUntil   atomic.Pointer[providerRetryError]
+ }
+ 
+ func (f *Fetcher[V]) Name() string {
+@@ -114,14 +126,52 @@ func (f *Fetcher[V]) Initial() (V, error) {
+ }
+ 
+ func (f *Fetcher[V]) Update() (V, bool, error) {
++	if retry := f.retryUntil.Load(); retry != nil && time.Until(retry.until) > 0 {
++		return lo.Empty[V](), false, retry
++	}
+ 	buf, hash, err := f.vehicle.Read(f.ctx, f.hash)
+ 	if err != nil {
+-		f.backoff.AddAttempt() // add a failed attempt to backoff
++		var status intervalStatusError
++		if errors.As(err, &status) {
++			f.backoff.Reset()
++			if f.interval > 0 {
++				delay := f.interval / (2 * time.Second) * time.Second
++				if f.interval%(2*time.Second) != 0 {
++					delay += time.Second
++				}
++				retry := &providerRetryError{status: status.Error(), until: time.Now().Add(delay)}
++				f.rememberRetry(retry)
++				return lo.Empty[V](), false, retry
++			}
++		} else {
++			f.backoff.AddAttempt()
++		}
+ 		return lo.Empty[V](), false, err
+ 	}
+ 	return f.loadBuf(buf, hash, f.vehicle.Type() != P.File)
+ }
+ 
++func (f *Fetcher[V]) rememberRetry(retry *providerRetryError) {
++	for {
++		current := f.retryUntil.Load()
++		if current != nil && !retry.until.After(current.until) {
++			return
++		}
++		if f.retryUntil.CompareAndSwap(current, retry) {
++			return
++		}
++	}
++}
++
++func (f *Fetcher[V]) intervalWithRetry(interval time.Duration) time.Duration {
++	if retry := f.retryUntil.Load(); retry != nil {
++		if delay := time.Until(retry.until); delay > 0 {
++			return delay
++		}
++	}
++	return interval
++}
++
+ func (f *Fetcher[V]) SideUpdate(buf []byte) (V, bool, error) {
+ 	return f.loadBuf(buf, utils.MakeHash(buf), true)
+ }
+@@ -187,11 +237,15 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+ 		initialInterval = f.backoff.ForAttempt(attempt)
+ 	}
+ 
+-	timer := time.NewTimer(initialInterval)
++	timer := time.NewTimer(f.intervalWithRetry(initialInterval))
+ 	defer timer.Stop()
+ 	for {
+ 		select {
+ 		case <-timer.C:
++			if wait := f.intervalWithRetry(0); wait > 0 {
++				timer.Reset(wait)
++				continue
++			}
+ 			f.updateWithLog()
+ 			interval := f.interval
+ 			if attempt := f.backoff.Attempt(); attempt > 0 { // f.Update() was failed, decrease the interval from backoff to achieve fast retry
+@@ -199,7 +253,7 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+ 					interval = duration
+ 				}
+ 			}
+-			timer.Reset(interval)
++			timer.Reset(f.intervalWithRetry(interval))
+ 		case <-f.ctx.Done():
+ 			return
+ 		}
+diff --git a/component/resource/fetcher_retry_interval_test.go b/component/resource/fetcher_retry_interval_test.go
+new file mode 100644
+index 0000000..028341d
+--- /dev/null
++++ b/component/resource/fetcher_retry_interval_test.go
+@@ -0,0 +1,97 @@
++package resource
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestProviderHalfIntervalRetryPolicy(t *testing.T) {
++	statuses := []int{http.StatusNotFound, http.StatusGone, http.StatusTooManyRequests}
++	for _, status := range statuses {
++		t.Run(http.StatusText(status), func(t *testing.T) {
++			for _, tc := range []struct {
++				name     string
++				interval time.Duration
++				delay    time.Duration
++			}{
++				{name: "even interval", interval: 100 * time.Second, delay: 50 * time.Second},
++				{name: "odd interval", interval: 101 * time.Second, delay: 51 * time.Second},
++				{name: "manual only"},
++			} {
++				t.Run(tc.name, func(t *testing.T) {
++					var requests atomic.Int32
++					fetcher := newTestHTTPFetcher(t, tc.interval, func(w http.ResponseWriter, _ *http.Request) {
++						if requests.Add(1) == 1 {
++							w.Header().Set("Retry-After", "18000")
++							w.WriteHeader(status)
++							return
++						}
++						_, _ = io.WriteString(w, "fresh")
++					})
++					fetcher.backoff.AddAttempt()
++
++					before := time.Now()
++					_, _, err := fetcher.Update()
++					after := time.Now()
++					if err == nil {
++						t.Fatalf("expected an HTTP %d error", status)
++					}
++					if got := fetcher.backoff.Attempt(); got != 0 {
++						t.Fatalf("attempts after HTTP %d = %v, want 0", status, got)
++					}
++
++					wantStatus := fmt.Sprintf("%d %s", status, http.StatusText(status))
++					if tc.interval == 0 {
++						if err.Error() != wantStatus || fetcher.retryUntil.Load() != nil {
++							t.Fatalf("expected HTTP %d without a local deadline", status)
++						}
++						if got, _, err := fetcher.Update(); err != nil || got != "fresh" {
++							t.Fatalf("expected an immediate manual refresh, got %q and error type %T", got, err)
++						}
++						return
++					}
++
++					var retry *providerRetryError
++					if !errors.As(err, &retry) {
++						t.Fatalf("expected a retry deadline, got error type %T", err)
++					}
++					if retry.status != wantStatus {
++						t.Fatalf("retry status = %q, want %q", retry.status, wantStatus)
++					}
++					if retry.until.Before(before.Add(tc.delay)) || retry.until.After(after.Add(tc.delay)) {
++						t.Fatalf("expected the retry deadline %v after the response", tc.delay)
++					}
++					if delay := fetcher.intervalWithRetry(tc.interval); delay <= 0 || delay > tc.delay {
++						t.Fatalf("timer delay = %v, should use the remaining half interval", delay)
++					}
++					if _, _, blocked := fetcher.Update(); blocked != retry {
++						t.Fatalf("expected the same retry deadline, got error type %T", blocked)
++					}
++					if got := requests.Load(); got != 1 {
++						t.Fatalf("requests during cooldown = %d, want 1", got)
++					}
++				})
++			}
++		})
++	}
++}
++
++func TestProviderForbiddenUsesBackoff(t *testing.T) {
++	fetcher := newTestHTTPFetcher(t, 100*time.Second, func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusForbidden)
++	})
++	if _, _, err := fetcher.Update(); err == nil || err.Error() != "403 Forbidden" {
++		t.Fatalf("expected an ordinary HTTP 403 error, got error type %T", err)
++	}
++	if got := fetcher.backoff.Attempt(); got != 1 {
++		t.Fatalf("backoff attempts = %v, want 1", got)
++	}
++	if fetcher.retryUntil.Load() != nil {
++		t.Fatal("HTTP 403 set a half-interval retry deadline")
++	}
++}
+diff --git a/component/resource/vehicle.go b/component/resource/vehicle.go
+index 86fb394..289a3bc 100644
+--- a/component/resource/vehicle.go
++++ b/component/resource/vehicle.go
+@@ -95,6 +95,12 @@ type HTTPVehicle struct {
+ 	provider  P.ProxyProvider
+ }
+ 
++type intervalStatusError string
++
++func (e intervalStatusError) Error() string {
++	return string(e)
++}
++
+ func (h *HTTPVehicle) Url() string {
+ 	return h.url
+ }
+@@ -150,6 +156,10 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
+ 		if setIfNoneMatch && resp.StatusCode == http.StatusNotModified {
+ 			return nil, oldHash, nil
+ 		}
++		switch resp.StatusCode {
++		case http.StatusNotFound, http.StatusGone, http.StatusTooManyRequests:
++			return nil, hash, intervalStatusError(resp.Status)
++		}
+ 		err = errors.New(resp.Status)
+ 		return
+ 	}

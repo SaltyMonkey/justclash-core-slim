@@ -1,0 +1,805 @@
+Support DNS client CIDRs in FakeIP filter rules, including TUN hijack.
+
+Based on upstream PR: https://github.com/MetaCubeX/mihomo/pull/2894
+Pass a typed source through the existing DNS relay and publish the active
+service atomically. Keep source handling in separate files where possible.
+Preserve domain-only provider metadata and skip address extraction on DNS
+listeners when the filter does not use the client address.
+
+diff --git a/component/fakeip/skipper.go b/component/fakeip/skipper.go
+--- a/component/fakeip/skipper.go
++++ b/component/fakeip/skipper.go
+@@ -1,6 +1,8 @@
+ package fakeip
+ 
+ import (
++	"net/netip"
++
+ 	C "github.com/metacubex/mihomo/constant"
+ )
+ 
+@@ -18,13 +20,7 @@
+ // ShouldSkipped return if domain should be skipped
+ func (p *Skipper) ShouldSkipped(domain string) bool {
+ 	if len(p.Rules) > 0 {
+-		metadata := &C.Metadata{Host: domain}
+-		for _, rule := range p.Rules {
+-			if matched, action := rule.Match(metadata, C.RuleMatchHelper{}); matched {
+-				return action == UseRealIP
+-			}
+-		}
+-		return false
++		return p.shouldSkipRule(domain, netip.Addr{})
+ 	}
+ 
+ 	should := p.shouldSkipped(domain)
+diff --git a/component/fakeip/skipper_source.go b/component/fakeip/skipper_source.go
+new file mode 100644
+--- /dev/null
++++ b/component/fakeip/skipper_source.go
+@@ -0,0 +1,35 @@
++package fakeip
++
++import (
++	"net/netip"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++// ShouldSkippedFrom evaluates direct source rules with the DNS client address.
++func (p *Skipper) ShouldSkippedFrom(domain string, source netip.Addr) bool {
++	if !source.IsValid() || len(p.Rules) == 0 {
++		return p.ShouldSkipped(domain)
++	}
++	return p.shouldSkipRule(domain, source)
++}
++
++func (p *Skipper) shouldSkipRule(domain string, source netip.Addr) bool {
++	metadata := &C.Metadata{Host: domain}
++	hasSource := source.IsValid()
++	for _, rule := range p.Rules {
++		// Preserve domain-only metadata for classical rule providers.
++		matchSource := hasSource && rule.RuleType() == C.SrcIPCIDR
++		if matchSource {
++			metadata.SrcIP = source
++		}
++		matched, action := rule.Match(metadata, C.RuleMatchHelper{})
++		if matched {
++			return action == UseRealIP
++		}
++		if matchSource {
++			metadata.SrcIP = netip.Addr{}
++		}
++	}
++	return false
++}
+diff --git a/component/resolver/relay.go b/component/resolver/relay.go
+--- a/component/resolver/relay.go
++++ b/component/resolver/relay.go
+@@ -5,6 +5,7 @@
+ 	"encoding/binary"
+ 	"io"
+ 	"net"
++	"net/netip"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/pool"
+@@ -27,6 +28,10 @@
+ }
+ 
+ func RelayDnsConn(ctx context.Context, conn net.Conn, readTimeout time.Duration) error {
++	return relayDnsConn(ctx, conn, readTimeout, netip.Addr{})
++}
++
++func relayDnsConn(ctx context.Context, conn net.Conn, readTimeout time.Duration, source netip.Addr) error {
+ 	buff := pool.Get(pool.UDPBufferSize)
+ 	defer func() {
+ 		_ = pool.Put(buff)
+@@ -56,7 +61,7 @@
+ 			defer cancel()
+ 			inData := buff[:n]
+ 			outBuff := buff[2:]
+-			msg, err := relayDnsPacket(ctx, inData, outBuff, 0)
++			msg, err := relayDnsPacket(ctx, inData, outBuff, 0, source)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -85,13 +90,13 @@
+ 	return nil
+ }
+ 
+-func relayDnsPacket(ctx context.Context, payload []byte, target []byte, maxSize int) ([]byte, error) {
++func relayDnsPacket(ctx context.Context, payload []byte, target []byte, maxSize int, source netip.Addr) ([]byte, error) {
+ 	msg := &D.Msg{}
+ 	if err := msg.Unpack(payload); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	r, err := ServeMsg(ctx, msg)
++	r, err := ServeMsgFrom(ctx, msg, source)
+ 	if err != nil {
+ 		m := new(D.Msg)
+ 		m.SetRcode(msg, D.RcodeServerFailure)
+@@ -121,5 +126,5 @@
+ 
+ // RelayDnsPacket will truncate udp message up to SafeDnsPacketSize
+ func RelayDnsPacket(ctx context.Context, payload []byte, target []byte) ([]byte, error) {
+-	return relayDnsPacket(ctx, payload, target, SafeDnsPacketSize)
++	return relayDnsPacket(ctx, payload, target, SafeDnsPacketSize, netip.Addr{})
+ }
+diff --git a/component/resolver/service.go b/component/resolver/service.go
+--- a/component/resolver/service.go
++++ b/component/resolver/service.go
+@@ -2,21 +2,24 @@
+ 
+ import (
+ 	"context"
++	"net/netip"
++
++	"github.com/metacubex/mihomo/common/atomic"
+ 
+ 	D "github.com/miekg/dns"
+ )
+ 
+-var DefaultService Service
++var defaultService atomic.TypedValue[Service]
+ 
+ type Service interface {
+ 	ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error)
+ }
+ 
++func SetDefaultService(service Service) {
++	defaultService.Store(service)
++}
++
+ // ServeMsg with a dns.Msg, return resolve dns.Msg
+ func ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
+-	if server := DefaultService; server != nil {
+-		return server.ServeMsg(ctx, msg)
+-	}
+-
+-	return nil, ErrIPNotFound
++	return ServeMsgFrom(ctx, msg, netip.Addr{})
+ }
+diff --git a/component/resolver/source.go b/component/resolver/source.go
+new file mode 100644
+--- /dev/null
++++ b/component/resolver/source.go
+@@ -0,0 +1,41 @@
++package resolver
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"time"
++
++	D "github.com/miekg/dns"
++)
++
++// SourceService can evaluate DNS rules that depend on the client address.
++type SourceService interface {
++	Service
++	NeedsSourceIP() bool
++	ServeMsgFrom(ctx context.Context, msg *D.Msg, source netip.Addr) (*D.Msg, error)
++}
++
++// ServeMsgFrom loads the current DNS service for each query, including during reload.
++func ServeMsgFrom(ctx context.Context, msg *D.Msg, source netip.Addr) (*D.Msg, error) {
++	if server := defaultService.Load(); server != nil {
++		if source.IsValid() {
++			if service, ok := server.(SourceService); ok && service.NeedsSourceIP() {
++				return service.ServeMsgFrom(ctx, msg, source)
++			}
++		}
++		return server.ServeMsg(ctx, msg)
++	}
++
++	return nil, ErrIPNotFound
++}
++
++// RelayDnsConnFrom relays a DNS connection from a known client address.
++func RelayDnsConnFrom(ctx context.Context, conn net.Conn, readTimeout time.Duration, source netip.Addr) error {
++	return relayDnsConn(ctx, conn, readTimeout, source)
++}
++
++// RelayDnsPacketFrom relays a DNS datagram from a known client address.
++func RelayDnsPacketFrom(ctx context.Context, payload []byte, target []byte, source netip.Addr) ([]byte, error) {
++	return relayDnsPacket(ctx, payload, target, SafeDnsPacketSize, source)
++}
+diff --git a/config/config.go b/config/config.go
+--- a/config/config.go
++++ b/config/config.go
+@@ -1650,8 +1650,8 @@
+ 			return nil, fmt.Errorf("dns.fake-ip-filter[%d] [%s] error: %w", idx, line, err)
+ 		}
+ 
+-		if !isDomainRule(parsed.RuleType()) && parsed.RuleType() != C.MATCH {
+-			return nil, fmt.Errorf("dns.fake-ip-filter[%d] [%s] error: rule type '%s' not supported, only domain-based rules allowed", idx, line, tp)
++		if !isDomainRule(parsed.RuleType()) && parsed.RuleType() != C.MATCH && parsed.RuleType() != C.SrcIPCIDR {
++			return nil, fmt.Errorf("dns.fake-ip-filter[%d] [%s] error: rule type '%s' not supported, only domain-based rules, SRC-IP-CIDR and MATCH allowed", idx, line, tp)
+ 		}
+ 
+ 		rules = append(rules, parsed)
+diff --git a/context/dns_source.go b/context/dns_source.go
+new file mode 100644
+--- /dev/null
++++ b/context/dns_source.go
+@@ -0,0 +1,30 @@
++package context
++
++import (
++	"context"
++	"net/netip"
++)
++
++type dnsContextWithSource struct {
++	context.Context
++	dns    DNSContext
++	source netip.Addr
++}
++
++// NewDNSContextFrom attaches a client address to a DNS request.
++func NewDNSContextFrom(ctx context.Context, source netip.Addr) *DNSContext {
++	if !source.IsValid() {
++		return NewDNSContext(ctx)
++	}
++	request := &dnsContextWithSource{Context: ctx, source: source}
++	request.dns = *NewDNSContext(request)
++	return &request.dns
++}
++
++// SourceIP returns an invalid address for requests without a client address.
++func (c *DNSContext) SourceIP() netip.Addr {
++	if request, ok := c.Context.(*dnsContextWithSource); ok {
++		return request.source
++	}
++	return netip.Addr{}
++}
+diff --git a/dns/middleware.go b/dns/middleware.go
+--- a/dns/middleware.go
++++ b/dns/middleware.go
+@@ -152,7 +152,7 @@
+ 			q := r.Question[0]
+ 
+ 			host := strings.TrimRight(q.Name, ".")
+-			if skipper.ShouldSkipped(host) {
++			if skipper.ShouldSkippedFrom(host, ctx.SourceIP()) {
+ 				return next(ctx, r)
+ 			}
+ 
+diff --git a/dns/server.go b/dns/server.go
+--- a/dns/server.go
++++ b/dns/server.go
+@@ -3,6 +3,8 @@
+ import (
+ 	"context"
+ 	"net"
++
++	"github.com/metacubex/mihomo/common/atomic"
+ 
+ 	"github.com/metacubex/mihomo/common/sockopt"
+ 	"github.com/metacubex/mihomo/component/resolver"
+@@ -20,7 +22,7 @@
+ )
+ 
+ type Server struct {
+-	service   resolver.Service
++	service   atomic.TypedValue[resolver.Service]
+ 	tcpServer *D.Server
+ 	udpServer *D.Server
+ }
+@@ -32,7 +34,7 @@
+ 
+ // ServeDNS implement D.Handler ServeDNS
+ func (s serverHandler) ServeDNS(w D.ResponseWriter, r *D.Msg) {
+-	msg, err := s.service.ServeMsg(context.Background(), r)
++	msg, err := s.serveMsg(w, r)
+ 	if err != nil {
+ 		m := new(D.Msg)
+ 		m.SetRcode(r, D.RcodeServerFailure)
+@@ -58,7 +60,7 @@
+ }
+ 
+ func (s *Server) SetService(service resolver.Service) {
+-	s.service = service
++	s.service.Store(service)
+ }
+ 
+ func ReCreateServer(addr string, lc C.InboundListenConfig, service resolver.Service) {
+@@ -77,7 +79,7 @@
+ 		server.udpServer = nil
+ 	}
+ 
+-	server.service = nil
++	server.SetService(nil)
+ 	address = ""
+ 
+ 	if addr == "" || lc == nil || service == nil {
+@@ -97,7 +99,9 @@
+ 	}
+ 
+ 	address = addr
+-	server = &Server{service: service}
++	s := &Server{}
++	s.SetService(service)
++	server = s
+ 
+ 	go func() {
+ 		p, err := lc.ListenPacket(context.Background(), "udp", addr)
+@@ -111,8 +115,8 @@
+ 		}
+ 
+ 		log.Infoln("DNS server(UDP) listening at: %s", p.LocalAddr().String())
+-		server.udpServer = &D.Server{Addr: addr, PacketConn: p, Handler: server.UDPHandler()}
+-		_ = server.udpServer.ActivateAndServe()
++		s.udpServer = &D.Server{Addr: addr, PacketConn: p, Handler: s.UDPHandler()}
++		_ = s.udpServer.ActivateAndServe()
+ 	}()
+ 
+ 	go func() {
+@@ -123,8 +127,8 @@
+ 		}
+ 
+ 		log.Infoln("DNS server(TCP) listening at: %s", l.Addr().String())
+-		server.tcpServer = &D.Server{Addr: addr, Listener: l, Handler: server.TCPHandler()}
+-		_ = server.tcpServer.ActivateAndServe()
++		s.tcpServer = &D.Server{Addr: addr, Listener: l, Handler: s.TCPHandler()}
++		_ = s.tcpServer.ActivateAndServe()
+ 	}()
+ 
+ }
+diff --git a/dns/service.go b/dns/service.go
+--- a/dns/service.go
++++ b/dns/service.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"errors"
++	"net/netip"
+ 
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	icontext "github.com/metacubex/mihomo/context"
+@@ -10,16 +11,27 @@
+ )
+ 
+ type Service struct {
+-	handler handler
++	handler       handler
++	needsSourceIP bool
+ }
+ 
+-// ServeMsg implement [resolver.Service] ResolveMsg
++// ServeMsg resolves a request without a client address.
+ func (s *Service) ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
++	return s.ServeMsgFrom(ctx, msg, netip.Addr{})
++}
++
++// ServeMsgFrom resolves a request from the given client.
++func (s *Service) ServeMsgFrom(ctx context.Context, msg *D.Msg, source netip.Addr) (*D.Msg, error) {
+ 	if len(msg.Question) == 0 {
+ 		return nil, errors.New("at least one question is required")
+ 	}
+ 
+-	r, err := s.handler(icontext.NewDNSContext(ctx), msg)
++	if s.needsSourceIP {
++		source = source.Unmap()
++	} else {
++		source = netip.Addr{}
++	}
++	r, err := s.handler(icontext.NewDNSContextFrom(ctx, source), msg)
+ 	if err != nil {
+ 		return r, err
+ 	}
+@@ -38,8 +50,11 @@
+ 	return r, nil
+ }
+ 
+-var _ resolver.Service = (*Service)(nil)
++var _ resolver.SourceService = (*Service)(nil)
+ 
+ func NewService(resolver resolver.Resolver, mapper *ResolverEnhancer) *Service {
+-	return &Service{handler: newHandler(resolver, mapper)}
++	return &Service{
++		handler:       newHandler(resolver, mapper),
++		needsSourceIP: fakeIPNeedsSource(mapper),
++	}
+ }
+diff --git a/dns/source.go b/dns/source.go
+new file mode 100644
+--- /dev/null
++++ b/dns/source.go
+@@ -0,0 +1,56 @@
++package dns
++
++import (
++	"context"
++	"net"
++	"net/netip"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	C "github.com/metacubex/mihomo/constant"
++	D "github.com/miekg/dns"
++)
++
++func (s *Server) serveMsg(w D.ResponseWriter, r *D.Msg) (*D.Msg, error) {
++	service := s.service.Load()
++	if service == nil {
++		return nil, resolver.ErrIPNotFound
++	}
++	ctx := context.Background()
++	if sourceService, ok := service.(resolver.SourceService); ok && sourceService.NeedsSourceIP() {
++		return sourceService.ServeMsgFrom(ctx, r, dnsSourceIP(w.RemoteAddr()))
++	}
++	return service.ServeMsg(ctx, r)
++}
++
++func dnsSourceIP(addr net.Addr) netip.Addr {
++	switch addr := addr.(type) {
++	case *net.UDPAddr:
++		return addr.AddrPort().Addr()
++	case *net.TCPAddr:
++		return addr.AddrPort().Addr()
++	case nil:
++		return netip.Addr{}
++	default:
++		addrPort, err := netip.ParseAddrPort(addr.String())
++		if err == nil {
++			return addrPort.Addr()
++		}
++		return netip.Addr{}
++	}
++}
++
++// NeedsSourceIP reports whether the current FakeIP rules use the client address.
++func (s *Service) NeedsSourceIP() bool {
++	return s.needsSourceIP
++}
++
++func fakeIPNeedsSource(mapper *ResolverEnhancer) bool {
++	if mapper != nil && mapper.FakeIPEnabled() && mapper.fakeIPSkipper != nil {
++		for _, rule := range mapper.fakeIPSkipper.Rules {
++			if rule.RuleType() == C.SrcIPCIDR {
++				return true
++			}
++		}
++	}
++	return false
++}
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -239,7 +239,7 @@
+ 	if !c.Enable {
+ 		resolver.DefaultResolver = nil
+ 		resolver.DefaultHostMapper = nil
+-		resolver.DefaultService = nil
++		resolver.SetDefaultService(nil)
+ 		resolver.ProxyServerHostResolver = nil
+ 		resolver.DirectHostResolver = nil
+ 		dns.ReCreateServer("", nil, nil)
+@@ -283,7 +283,7 @@
+ 
+ 	resolver.DefaultResolver = r
+ 	resolver.DefaultHostMapper = m
+-	resolver.DefaultService = s
++	resolver.SetDefaultService(s)
+ 	resolver.UseSystemHosts = c.UseSystemHosts
+ 
+ 	if r.ProxyResolver.Invalid() {
+diff --git a/listener/sing_tun/dns.go b/listener/sing_tun/dns.go
+--- a/listener/sing_tun/dns.go
++++ b/listener/sing_tun/dns.go
+@@ -30,7 +30,7 @@
+ func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+ 	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+ 		log.Debugln("[DNS] hijack tcp:%s", metadata.Destination.String())
+-		return resolver.RelayDnsConn(ctx, conn, resolver.DefaultDnsReadTimeout)
++		return resolver.RelayDnsConnFrom(ctx, conn, resolver.DefaultDnsReadTimeout, metadata.Source.Addr)
+ 	}
+ 	return h.ListenerHandler.NewConnection(ctx, conn, metadata)
+ }
+@@ -44,7 +44,7 @@
+ 			RearHeadroom:  network.CalculateRearHeadroom(writer),
+ 			MTU:           resolver.SafeDnsPacketSize,
+ 		}
+-		go relayDnsPacket(ctx, buffer, rwOptions, metadata.Destination, nil, &writer)
++		go relayDnsPacket(ctx, buffer, rwOptions, metadata.Destination, metadata.Source.Addr, nil, &writer)
+ 		return
+ 	}
+ 	h.ListenerHandler.NewPacket(ctx, key, buffer, metadata, init)
+@@ -96,14 +96,14 @@
+ 				}
+ 				return err
+ 			}
+-			go relayDnsPacket(ctx, readBuff, rwOptions, dest, &mutex, &writer)
++			go relayDnsPacket(ctx, readBuff, rwOptions, dest, metadata.Source.Addr, &mutex, &writer)
+ 		}
+ 		return nil
+ 	}
+ 	return h.ListenerHandler.NewPacketConnection(ctx, conn, metadata)
+ }
+ 
+-func relayDnsPacket(ctx context.Context, readBuff *buf.Buffer, rwOptions network.ReadWaitOptions, dest M.Socksaddr, mutex *sync.Mutex, writer *network.PacketWriter) {
++func relayDnsPacket(ctx context.Context, readBuff *buf.Buffer, rwOptions network.ReadWaitOptions, dest M.Socksaddr, source netip.Addr, mutex *sync.Mutex, writer *network.PacketWriter) {
+ 	ctx, cancel := context.WithTimeout(ctx, resolver.DefaultDnsRelayTimeout)
+ 	defer cancel()
+ 	inData := readBuff.Bytes()
+@@ -112,7 +112,7 @@
+ 	if len(writeBuff.FreeBytes()) < resolver.SafeDnsPacketSize { // only create a new buffer when space don't enough
+ 		writeBuff = rwOptions.NewPacketBuffer()
+ 	}
+-	msg, err := resolver.RelayDnsPacket(ctx, inData, writeBuff.FreeBytes())
++	msg, err := resolver.RelayDnsPacketFrom(ctx, inData, writeBuff.FreeBytes(), source)
+ 	if writeBuff != readBuff {
+ 		readBuff.Release()
+ 	}
+diff --git a/listener/sing_tun/dns_source_test.go b/listener/sing_tun/dns_source_test.go
+new file mode 100644
+--- /dev/null
++++ b/listener/sing_tun/dns_source_test.go
+@@ -0,0 +1,264 @@
++package sing_tun_test
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/dns"
++	"github.com/metacubex/mihomo/hub/executor"
++	"github.com/metacubex/mihomo/listener/sing_tun"
++
++	"github.com/metacubex/sing/common/buf"
++	M "github.com/metacubex/sing/common/metadata"
++	"github.com/metacubex/sing/common/network"
++	D "github.com/miekg/dns"
++)
++
++var (
++	sourceFakeRange = netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 18}), 16)
++	sourceRealAddr  = netip.AddrFrom4([4]byte{192, 0, 2, 100})
++	sourceSelected  = netip.AddrFrom4([4]byte{192, 0, 2, 1})
++	sourceOther     = netip.AddrFrom4([4]byte{192, 0, 2, 2})
++	sourceV6        = netip.AddrFrom16([16]byte{0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
++)
++
++type sourceTestResolver struct{ resolver.Resolver }
++
++func (sourceTestResolver) ExchangeContext(_ context.Context, req *D.Msg) (*D.Msg, error) {
++	msg := new(D.Msg).SetReply(req)
++	msg.Answer = []D.RR{&D.A{
++		Hdr: D.RR_Header{Name: req.Question[0].Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60},
++		A:   sourceRealAddr.AsSlice(),
++	}}
++	return msg, nil
++}
++
++func sourceTestService(t *testing.T, sourceRules bool) *dns.Service {
++	t.Helper()
++	sourceFilters := ""
++	if sourceRules {
++		sourceFilters = fmt.Sprintf("    - SRC-IP-CIDR,%s,real-ip\n    - SRC-IP-CIDR,%s,real-ip\n",
++			netip.PrefixFrom(sourceSelected, 32), netip.PrefixFrom(sourceV6, 128))
++	}
++	rules := fmt.Sprintf("dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: %s\n  fake-ip-filter-mode: rule\n  fake-ip-filter:\n%s    - MATCH,fake-ip\n", sourceFakeRange, sourceFilters)
++	cfg, err := executor.ParseWithBytes([]byte(rules))
++	if err != nil {
++		t.Fatal(err)
++	}
++	mapper := dns.NewEnhancer(dns.EnhancerConfig{
++		EnhancedMode:  cfg.DNS.EnhancedMode,
++		FakeIPPool:    cfg.DNS.FakeIPPool,
++		FakeIPSkipper: cfg.DNS.FakeIPSkipper,
++	})
++	return dns.NewService(sourceTestResolver{}, mapper)
++}
++
++func sourceTestQuery() *D.Msg {
++	return new(D.Msg).SetQuestion("fakeip-source-fixture.invalid.", D.TypeA)
++}
++
++func checkSourceReply(t *testing.T, reply *D.Msg, wantReal bool) {
++	t.Helper()
++	if reply == nil || len(reply.Answer) != 1 {
++		t.Fatal("expected one DNS answer")
++	}
++	record, ok := reply.Answer[0].(*D.A)
++	if !ok {
++		t.Fatal("expected an A record")
++	}
++	ip, ok := netip.AddrFromSlice(record.A)
++	if !ok || (wantReal && ip.Unmap() != sourceRealAddr) || (!wantReal && !sourceFakeRange.Contains(ip.Unmap())) {
++		t.Fatalf("answer did not follow source rule (want real: %t)", wantReal)
++	}
++}
++
++type sourceTestDNSWriter struct {
++	D.ResponseWriter
++	source net.Addr
++	reply  *D.Msg
++}
++
++func (w *sourceTestDNSWriter) RemoteAddr() net.Addr {
++	if w.source == nil {
++		panic("DNS listener looked up the address without a source rule")
++	}
++	return w.source
++}
++
++func (w *sourceTestDNSWriter) WriteMsg(msg *D.Msg) error {
++	w.reply = msg
++	return nil
++}
++
++type customSourceAddr string
++
++func (customSourceAddr) Network() string  { return "packet-fixture" }
++func (a customSourceAddr) String() string { return string(a) }
++
++func TestFakeIPSourceDNSListener(t *testing.T) {
++	server := new(dns.Server)
++	server.SetService(sourceTestService(t, true))
++	for _, test := range []struct {
++		name     string
++		handler  D.Handler
++		address  net.Addr
++		wantReal bool
++	}{
++		{"udp-ipv4-mapped", server.UDPHandler(), &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 51320}, true},
++		{"udp-other-client", server.UDPHandler(), &net.UDPAddr{IP: sourceOther.AsSlice(), Port: 51320}, false},
++		{"tcp-ipv6-zone", server.TCPHandler(), &net.TCPAddr{IP: sourceV6.AsSlice(), Port: 51320, Zone: "fixture-scope"}, true},
++		{"custom-addr", server.UDPHandler(), customSourceAddr(netip.AddrPortFrom(sourceSelected, 51320).String()), true},
++		{"invalid-addr", server.UDPHandler(), customSourceAddr("no-address"), false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			writer := &sourceTestDNSWriter{source: test.address}
++			test.handler.ServeDNS(writer, sourceTestQuery())
++			checkSourceReply(t, writer.reply, test.wantReal)
++		})
++	}
++
++	server.SetService(sourceTestService(t, false))
++	writer := new(sourceTestDNSWriter)
++	server.TCPHandler().ServeDNS(writer, sourceTestQuery())
++	checkSourceReply(t, writer.reply, false)
++}
++
++type sourceTestPacketConn struct {
++	network.PacketConn
++	payload []byte
++	target  M.Socksaddr
++	reply   chan *D.Msg
++	written chan struct{}
++	read    bool
++}
++
++func (c *sourceTestPacketConn) SetReadDeadline(time.Time) error { return nil }
++func (c *sourceTestPacketConn) Close() error                    { return nil }
++
++func (c *sourceTestPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	if c.read {
++		select {
++		case <-c.written:
++			return M.Socksaddr{}, io.EOF
++		case <-time.After(3 * time.Second):
++			return M.Socksaddr{}, context.DeadlineExceeded
++		}
++	}
++	c.read = true
++	_, err := buffer.Write(c.payload)
++	return c.target, err
++}
++
++func (c *sourceTestPacketConn) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
++	reply := new(D.Msg)
++	err := reply.Unpack(buffer.Bytes())
++	if err == nil {
++		buffer.Release()
++	} else {
++		reply = nil
++	}
++	c.reply <- reply
++	close(c.written)
++	return err
++}
++
++func TestFakeIPSourceTUN(t *testing.T) {
++	enabled := sourceTestService(t, true)
++	disabled := sourceTestService(t, false)
++	resolver.SetDefaultService(enabled)
++	t.Cleanup(func() { resolver.SetDefaultService(nil) })
++
++	target := netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 53}), 53)
++	handler := &sing_tun.ListenerHandler{DnsAddrPorts: []netip.AddrPort{target}}
++	metadata := M.Metadata{Source: M.SocksaddrFrom(sourceSelected, 51320), Destination: M.SocksaddrFromNetIP(target)}
++	payload, err := sourceTestQuery().Pack()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	for _, test := range []struct {
++		name       string
++		connection bool
++	}{
++		{"udp-packet", false},
++		{"udp-packet-connection", true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			conn := &sourceTestPacketConn{
++				payload: payload, target: metadata.Destination,
++				reply: make(chan *D.Msg, 1), written: make(chan struct{}),
++			}
++			if test.connection {
++				if err := handler.NewPacketConnection(context.Background(), conn, metadata); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				packet := buf.NewPacket()
++				if _, err := packet.Write(payload); err != nil {
++					packet.Release()
++					t.Fatal(err)
++				}
++				handler.NewPacket(context.Background(), metadata.Source.AddrPort(), packet, metadata,
++					func(network.PacketConn) network.PacketWriter { return conn })
++			}
++			select {
++			case reply := <-conn.reply:
++				checkSourceReply(t, reply, true)
++			case <-time.After(3 * time.Second):
++				t.Fatal("TUN DNS returned no answer")
++			}
++		})
++	}
++
++	t.Run("tcp-reload", func(t *testing.T) {
++		resolver.SetDefaultService(disabled)
++		client, server := net.Pipe()
++		defer client.Close()
++		done := make(chan error, 1)
++		go func() { done <- handler.NewConnection(context.Background(), server, metadata) }()
++		conn := &D.Conn{Conn: client}
++		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
++			t.Fatal(err)
++		}
++		for _, test := range []struct {
++			service  *dns.Service
++			wantReal bool
++		}{
++			{disabled, false}, {enabled, true}, {disabled, false},
++		} {
++			resolver.SetDefaultService(test.service)
++			if err := conn.WriteMsg(sourceTestQuery()); err != nil {
++				t.Fatal(err)
++			}
++			reply, err := conn.ReadMsg()
++			if err != nil {
++				t.Fatal(err)
++			}
++			checkSourceReply(t, reply, test.wantReal)
++		}
++		_ = client.Close()
++		select {
++		case err := <-done:
++			if err != nil {
++				t.Fatal(err)
++			}
++		case <-time.After(3 * time.Second):
++			t.Fatal("TUN DNS did not close")
++		}
++	})
++
++	t.Run("internal-unattributed", func(t *testing.T) {
++		resolver.SetDefaultService(enabled)
++		reply, err := resolver.ServeMsg(context.Background(), sourceTestQuery())
++		if err != nil {
++			t.Fatal(err)
++		}
++		checkSourceReply(t, reply, false)
++	})
++}

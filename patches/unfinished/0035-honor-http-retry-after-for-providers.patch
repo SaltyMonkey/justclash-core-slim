@@ -1,0 +1,277 @@
+Honor Retry-After on HTTP 403, 429 and 503 for provider downloads.
+
+A valid Retry-After header supplies a server deadline for scheduled and
+manual updates. Keep the local backoff as the minimum scheduled delay.
+Responses without a usable deadline follow the ordinary backoff.
+
+diff --git a/component/resource/fetcher.go b/component/resource/fetcher.go
+index f47e27f..f71364a 100644
+--- a/component/resource/fetcher.go
++++ b/component/resource/fetcher.go
+@@ -2,10 +2,12 @@ package resource
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"io"
+ 	"io/fs"
+ 	"os"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/utils"
+@@ -35,6 +37,7 @@ type Fetcher[V any] struct {
+ 	watcher      *fswatch.Watcher
+ 	loadBufMutex sync.Mutex
+ 	backoff      slowdown.Backoff
++	retryAfter   atomic.Pointer[retryAfterError]
+ }
+ 
+ func (f *Fetcher[V]) Name() string {
+@@ -114,14 +117,42 @@ func (f *Fetcher[V]) Initial() (V, error) {
+ }
+ 
+ func (f *Fetcher[V]) Update() (V, bool, error) {
++	if retry := f.retryAfter.Load(); retry != nil && time.Until(retry.until) > 0 {
++		return lo.Empty[V](), false, retry
++	}
+ 	buf, hash, err := f.vehicle.Read(f.ctx, f.hash)
+ 	if err != nil {
+ 		f.backoff.AddAttempt() // add a failed attempt to backoff
++		var retry *retryAfterError
++		if errors.As(err, &retry) {
++			f.rememberRetryAfter(retry)
++		}
+ 		return lo.Empty[V](), false, err
+ 	}
+ 	return f.loadBuf(buf, hash, f.vehicle.Type() != P.File)
+ }
+ 
++func (f *Fetcher[V]) rememberRetryAfter(retry *retryAfterError) {
++	for {
++		current := f.retryAfter.Load()
++		if current != nil && !retry.until.After(current.until) {
++			return
++		}
++		if f.retryAfter.CompareAndSwap(current, retry) {
++			return
++		}
++	}
++}
++
++func (f *Fetcher[V]) intervalWithRetryAfter(interval time.Duration) time.Duration {
++	if retry := f.retryAfter.Load(); retry != nil {
++		if delay := time.Until(retry.until); delay > 0 && delay > interval {
++			return delay
++		}
++	}
++	return interval
++}
++
+ func (f *Fetcher[V]) SideUpdate(buf []byte) (V, bool, error) {
+ 	return f.loadBuf(buf, utils.MakeHash(buf), true)
+ }
+@@ -187,7 +218,7 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+ 		initialInterval = f.backoff.ForAttempt(attempt)
+ 	}
+ 
+-	timer := time.NewTimer(initialInterval)
++	timer := time.NewTimer(f.intervalWithRetryAfter(initialInterval))
+ 	defer timer.Stop()
+ 	for {
+ 		select {
+@@ -199,7 +230,7 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
+ 					interval = duration
+ 				}
+ 			}
+-			timer.Reset(interval)
++			timer.Reset(f.intervalWithRetryAfter(interval))
+ 		case <-f.ctx.Done():
+ 			return
+ 		}
+diff --git a/component/resource/fetcher_retry_after_test.go b/component/resource/fetcher_retry_after_test.go
+new file mode 100644
+index 0000000..29c7b38
+--- /dev/null
++++ b/component/resource/fetcher_retry_after_test.go
+@@ -0,0 +1,122 @@
++package resource
++
++import (
++	"errors"
++	"io"
++	"net/http"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestParseProviderRetryAfter(t *testing.T) {
++	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
++	until := now.Add(time.Minute)
++
++	for _, tc := range []struct {
++		name  string
++		value string
++		want  time.Time
++	}{
++		{name: "seconds", value: " 60 ", want: until},
++		{name: "HTTP date", value: until.Format(http.TimeFormat), want: until},
++		{name: "zero", value: "0", want: now},
++		{name: "missing"},
++		{name: "invalid", value: "soon"},
++		{name: "negative", value: "-60"},
++		{name: "duration overflow", value: "9223372037"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := parseRetryAfter(tc.value, now); !got.Equal(tc.want) {
++				t.Fatalf("parseRetryAfter(%q) = %v, want %v", tc.value, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestProviderRetryAfterBlocksManualRefresh(t *testing.T) {
++	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
++		t.Run(http.StatusText(status), func(t *testing.T) {
++			var requests atomic.Int32
++			fetcher := newTestHTTPFetcher(t, time.Hour, func(w http.ResponseWriter, _ *http.Request) {
++				if requests.Add(1) == 1 {
++					w.Header().Set("Retry-After", "60")
++					w.WriteHeader(status)
++					return
++				}
++				_, _ = io.WriteString(w, "fresh")
++			})
++
++			before := time.Now()
++			_, _, err := fetcher.Update()
++			var retry *retryAfterError
++			if !errors.As(err, &retry) {
++				t.Fatalf("expected a retry deadline, got error type %T", err)
++			}
++			if retry.until.Before(before.Add(time.Minute)) || retry.until.After(time.Now().Add(time.Minute)) {
++				t.Fatal("retry deadline should be 60 seconds after the response")
++			}
++
++			if _, _, blocked := fetcher.Update(); blocked != retry {
++				t.Fatalf("expected the same retry deadline, got error type %T", blocked)
++			}
++			if got := requests.Load(); got != 1 {
++				t.Fatalf("requests during cooldown = %d, want 1", got)
++			}
++			if got := fetcher.backoff.Attempt(); got != 1 {
++				t.Fatalf("attempts during cooldown = %v, want 1", got)
++			}
++
++			if got := fetcher.intervalWithRetryAfter(time.Second); got <= time.Second {
++				t.Fatalf("timer delay = %v, should wait for the server deadline", got)
++			}
++			if got := fetcher.intervalWithRetryAfter(time.Hour); got != time.Hour {
++				t.Fatalf("timer delay = %v, should preserve a longer local backoff", got)
++			}
++
++			fetcher.retryAfter.Store(&retryAfterError{status: retry.status, until: before.Add(-time.Second)})
++			if got, _, err := fetcher.Update(); err != nil || got != "fresh" {
++				t.Fatalf("expected a refresh after expiry, got %q and error type %T", got, err)
++			}
++			if got := requests.Load(); got != 2 {
++				t.Fatalf("requests after expiry = %d, want 2", got)
++			}
++		})
++	}
++}
++
++func TestProviderRetryAfterFallsBackToBackoff(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		status int
++		value  string
++	}{
++		{name: "403 without header", status: http.StatusForbidden},
++		{name: "429 without header", status: http.StatusTooManyRequests},
++		{name: "429 with invalid header", status: http.StatusTooManyRequests, value: "invalid"},
++		{name: "429 with zero delay", status: http.StatusTooManyRequests, value: "0"},
++		{name: "429 with past date", status: http.StatusTooManyRequests, value: "Thu, 01 Jan 1970 00:00:00 GMT"},
++		{name: "503 without header", status: http.StatusServiceUnavailable},
++		{name: "502 with valid header", status: http.StatusBadGateway, value: "60"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			fetcher := newTestHTTPFetcher(t, time.Hour, func(w http.ResponseWriter, _ *http.Request) {
++				if tc.value != "" {
++					w.Header().Set("Retry-After", tc.value)
++				}
++				w.WriteHeader(tc.status)
++			})
++
++			_, _, err := fetcher.Update()
++			if err == nil {
++				t.Fatalf("expected an HTTP %d error", tc.status)
++			}
++			if retry := fetcher.retryAfter.Load(); retry != nil {
++				t.Fatal("unexpected Retry-After cooldown")
++			}
++			if got := fetcher.backoff.Attempt(); got != 1 {
++				t.Fatalf("attempts after HTTP %d = %v, want 1", tc.status, got)
++			}
++		})
++	}
++}
+diff --git a/component/resource/vehicle.go b/component/resource/vehicle.go
+index 86fb394..0b372c1 100644
+--- a/component/resource/vehicle.go
++++ b/component/resource/vehicle.go
+@@ -4,8 +4,11 @@ import (
+ 	"context"
+ 	"errors"
+ 	"io"
++	"math"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/utils"
+@@ -95,6 +98,26 @@ type HTTPVehicle struct {
+ 	provider  P.ProxyProvider
+ }
+ 
++type retryAfterError struct {
++	status string
++	until  time.Time
++}
++
++func (e *retryAfterError) Error() string {
++	return e.status + " (retry after " + e.until.UTC().Format(time.RFC3339) + ")"
++}
++
++func parseRetryAfter(value string, now time.Time) time.Time {
++	value = strings.TrimSpace(value)
++	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil && seconds <= uint64(math.MaxInt64/time.Second) {
++		return now.Add(time.Duration(seconds) * time.Second)
++	}
++	if until, err := http.ParseTime(value); err == nil {
++		return until
++	}
++	return time.Time{}
++}
++
+ func (h *HTTPVehicle) Url() string {
+ 	return h.url
+ }
+@@ -150,6 +173,13 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
+ 		if setIfNoneMatch && resp.StatusCode == http.StatusNotModified {
+ 			return nil, oldHash, nil
+ 		}
++		switch resp.StatusCode {
++		case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
++			now := time.Now()
++			if until := parseRetryAfter(resp.Header.Get("Retry-After"), now); until.After(now) {
++				return nil, hash, &retryAfterError{status: resp.Status, until: until}
++			}
++		}
+ 		err = errors.New(resp.Status)
+ 		return
+ 	}

@@ -1,0 +1,111 @@
+Reject HTTP provider downloads that exceed size-limit.
+
+A truncated body can still parse and overwrite the working cache.
+Read one byte past the limit and reject oversized responses before
+hashing or parsing them. An exact fit is accepted, and nonpositive
+limits continue to allow downloads of any size.
+
+diff --git a/component/resource/fetcher_size_limit_test.go b/component/resource/fetcher_size_limit_test.go
+new file mode 100644
+index 0000000..b71229a
+--- /dev/null
++++ b/component/resource/fetcher_size_limit_test.go
+@@ -0,0 +1,64 @@
++package resource
++
++import (
++	"io"
++	"math"
++	"net/http"
++	"os"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestProviderDownloadSizeLimit(t *testing.T) {
++	const body = "first\nsecond\n"
++	const cached = "previous\n"
++
++	for _, tc := range []struct {
++		name   string
++		limit  int64
++		reject bool
++	}{
++		{name: "above limit", limit: int64(len(body) - 1), reject: true},
++		{name: "exact limit", limit: int64(len(body))},
++		{name: "below limit", limit: int64(len(body) + 1)},
++		{name: "zero limit"},
++		{name: "negative limit", limit: -1},
++		{name: "largest limit", limit: math.MaxInt64},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			fetcher := newTestHTTPFetcher(t, time.Hour, func(w http.ResponseWriter, _ *http.Request) {
++				_, _ = io.WriteString(w, body)
++			})
++			vehicle := fetcher.Vehicle().(*HTTPVehicle)
++			vehicle.sizeLimit = tc.limit
++			if _, _, err := fetcher.SideUpdate([]byte(cached)); err != nil {
++				t.Fatalf("cannot seed provider cache: %T", err)
++			}
++
++			parsed := false
++			fetcher.parser = func(buf []byte) (string, error) {
++				parsed = true
++				return string(buf), nil
++			}
++			got, _, err := fetcher.Update()
++			wantCache := body
++			if tc.reject {
++				if err == nil || !strings.Contains(err.Error(), "exceeds size-limit") {
++					t.Error("expected an oversized response error")
++				}
++				if parsed {
++					t.Error("oversized response reached the parser")
++				}
++				wantCache = cached
++			} else if err != nil || got != body {
++				t.Fatalf("expected the complete body, got %q and error type %T", got, err)
++			}
++
++			data, err := os.ReadFile(vehicle.Path())
++			if err != nil || string(data) != wantCache {
++				t.Fatalf("cache = %q, want %q, error type %T", data, wantCache, err)
++			}
++		})
++	}
++}
+diff --git a/component/resource/vehicle.go b/component/resource/vehicle.go
+index 7f170a3..7895c63 100644
+--- a/component/resource/vehicle.go
++++ b/component/resource/vehicle.go
+@@ -3,7 +3,9 @@ package resource
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
++	"math"
+ 	"os"
+ 	"path/filepath"
+ 	"time"
+@@ -165,13 +167,17 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
+ 		return
+ 	}
+ 	var reader io.Reader = resp.Body
+-	if h.sizeLimit > 0 {
+-		reader = io.LimitReader(reader, h.sizeLimit)
++	if h.sizeLimit > 0 && h.sizeLimit < math.MaxInt64 {
++		// Read one extra byte to distinguish an exact fit from an oversized body.
++		reader = io.LimitReader(reader, h.sizeLimit+1)
+ 	}
+ 	buf, err = io.ReadAll(reader)
+ 	if err != nil {
+ 		return
+ 	}
++	if h.sizeLimit > 0 && int64(len(buf)) > h.sizeLimit {
++		return nil, hash, fmt.Errorf("provider response exceeds size-limit of %d bytes", h.sizeLimit)
++	}
+ 	hash = utils.MakeHash(buf)
+ 	if etag {
+ 		cachefile.Cache().SetETagWithHash(h.url, cachefile.EtagWithHash{
